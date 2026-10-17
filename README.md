@@ -16,6 +16,56 @@ standard-library server on the same port. Port 8010 is intentional so this
 standalone prototype does not collide with another local app using port 8000.
 A different port can be selected with `CODEFLOW_PORT=8011`.
 
+## Deploy on Render
+
+This repository includes `requirements.txt` and `render.yaml`. In Render:
+
+1. Create a **New Web Service** and connect the GitHub repository
+   `shauryapratap969687-cmyk/codeflow`.
+2. Choose the Python runtime. Render can use the checked-in Blueprint by
+   selecting **New → Blueprint** and choosing this repository, or enter these
+   commands manually:
+
+   ```text
+   Build Command: pip install -r requirements.txt
+   Start Command: python backend.py
+   ```
+
+3. Deploy the service. Render supplies `PORT`; `backend.py` reads it and binds
+   to the required public interface automatically.
+4. Open the generated `https://<service-name>.onrender.com` URL. The frontend
+   already calls `/api/execute`, `/api/verify`, `/api/ai`, and `/api/health` as
+   same-origin routes, so no frontend API URL change is needed.
+
+### Configure remote AI on Render
+
+In the Render service's **Environment** tab, add these variables. Never put the
+key in `index.html`, `app.js`, GitHub, or a public README.
+
+```text
+CODEFLOW_AI_API_KEY=your-provider-key
+CODEFLOW_AI_BASE_URL=https://api.openai.com/v1
+CODEFLOW_AI_MODEL=gpt-4o-mini
+```
+
+For OpenRouter, use:
+
+```text
+CODEFLOW_AI_BASE_URL=https://openrouter.ai/api/v1
+CODEFLOW_AI_MODEL=openai/gpt-4o-mini
+```
+
+After saving environment variables, trigger a redeploy. Check the deployed
+configuration at:
+
+```text
+https://<service-name>.onrender.com/api/health
+```
+
+It should return `status: "ok"` and `ai_configured: true` when the key is
+present. If the key is absent, CodeFlow continues to run code but correctly
+shows **Not configured** for remote AI.
+
 The backend serves the local frontend and exposes:
 
 - `POST /api/execute` — `{ language, code }` → `{ output, variables, diagnostics }`

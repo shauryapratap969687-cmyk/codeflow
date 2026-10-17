@@ -983,10 +983,11 @@ def serve(host: str = "127.0.0.1", port: int = 8010) -> None:
 
 
 def main() -> None:
-    host = os.environ.get("CODEFLOW_HOST", "127.0.0.1")
-    # Keep the standalone prototype separate from any other local app that
-    # may already own port 8000 in the workspace.
-    port = int(os.environ.get("CODEFLOW_PORT", "8010"))
+    # Render and other managed hosts provide PORT and require binding on all
+    # interfaces. Local development keeps the safer loopback default and uses
+    # 8010 so it does not collide with another app on port 8000.
+    host = os.environ.get("CODEFLOW_HOST") or ("0.0.0.0" if os.environ.get("RENDER") else "127.0.0.1")
+    port = int(os.environ.get("PORT") or os.environ.get("CODEFLOW_PORT", "8010"))
     if FASTAPI_AVAILABLE:
         try:
             import uvicorn
