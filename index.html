@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="CodeFlow — a visual code learning and debugging workspace.">
+  <title>CodeFlow · Visualize your code</title>
+  <link rel="stylesheet" href="styles.css">
+  <link rel="stylesheet" href="responsive.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <a class="brand" href="#home" aria-label="CodeFlow home"><span class="brand-mark">⌘</span><span>Code<span class="brand-accent">Flow</span></span></a>
+      <nav class="main-nav" aria-label="Primary navigation">
+        <a class="nav-link active" href="#home">Home</a>
+        <a class="nav-link" href="#visualizer">Visualizer</a>
+        <a class="nav-link" href="#examples">Examples</a>
+        <a class="nav-link" href="#learn">Learn</a>
+        <a class="nav-link" href="#challenges">Challenges</a>
+      </nav>
+      <div class="top-actions"><button class="icon-button" id="theme-toggle" title="Toggle theme" aria-label="Toggle theme">☼</button><button class="button button-ghost" id="import-button">Import</button><button class="button button-primary" id="export-button">Export <span aria-hidden="true">↗</span></button></div>
+      <button class="mobile-menu" id="mobile-menu" aria-label="Toggle navigation" aria-expanded="false">☰</button>
+    </header>
+
+    <main>
+      <section class="hero page-section" id="home">
+        <div class="hero-copy">
+          <div class="eyebrow"><span class="status-dot"></span> Interactive code learning</div>
+          <h1>See the <span class="gradient-text">story</span><br>inside your code.</h1>
+          <p>Write, run, and understand code one step at a time. CodeFlow turns execution into a visual map you can explore.</p>
+          <div class="hero-actions"><a class="button button-primary button-large" href="#visualizer">Open visualizer <span aria-hidden="true">→</span></a><a class="text-link" href="#examples">Explore examples <span aria-hidden="true">↗</span></a></div>
+          <div class="hero-proof"><span class="avatar-stack"><i>AL</i><i>MK</i><i>JR</i><i>+</i></span><span>Trusted by curious builders</span></div>
+        </div>
+        <div class="hero-visual" aria-label="Code execution preview">
+          <div class="glow-orb orb-one"></div><div class="glow-orb orb-two"></div>
+          <div class="mini-window glass-card"><div class="window-chrome"><span></span><span></span><span></span><b>playground.py</b><em>● synced</em></div><div class="mini-code"><span class="muted">01</span> <span class="purple">def</span> <span class="blue">fibonacci</span>(n):<br><span class="muted">02</span> &nbsp;&nbsp;<span class="purple">if</span> n &lt;= <span class="orange">1</span>:<br><span class="muted">03</span> &nbsp;&nbsp;&nbsp;&nbsp;<span class="purple">return</span> n<br><span class="muted">04</span> &nbsp;&nbsp;<span class="purple">return</span> fibonacci(n-<span class="orange">1</span>) + ...</div><div class="mini-flow"><span class="flow-node active">start</span><i>→</i><span class="flow-node">if</span><i>→</i><span class="flow-node">return</span></div></div>
+          <div class="floating-stat glass-card"><span class="stat-icon">↯</span><div><strong>12 steps</strong><small>execution mapped</small></div></div>
+        </div>
+      </section>
+
+      <section class="workspace page-section" id="visualizer">
+        <div class="section-heading workspace-heading">
+          <div><div class="eyebrow">THE WORKSPACE</div><h2>Learn as you run.</h2><p class="section-note">Edit on the left, then follow the selected step on the right.</p></div>
+          <div class="workspace-tools"><span class="save-state" id="save-state">All changes saved</span><button class="button button-ghost" id="restore-button">↶ Restore</button><button class="button button-ghost" id="undo-button">↩ Undo</button></div>
+        </div>
+
+        <div class="workspace-grid">
+          <section class="panel editor-panel" aria-label="Code editor">
+            <div class="panel-header editor-header"><div class="file-tab"><span class="python-dot"></span><span id="file-name">main.py</span><span class="tab-close">×</span></div><div class="editor-actions"><select id="language-select" aria-label="Programming language"><option value="python">Python</option><option value="javascript">JavaScript</option></select><button class="icon-button small" id="find-button" title="Find and replace">⌕</button></div></div>
+            <div class="editor-wrap"><div class="line-numbers" id="line-numbers" aria-hidden="true"></div><textarea id="code-editor" spellcheck="false" aria-label="Code editor">def greet(name):
+    message = f"Hello, {name}!"
+    return message
+
+name = "world"
+result = greet(name)
+print(result)</textarea></div>
+            <div class="find-bar hidden" id="find-bar"><input id="find-input" type="search" placeholder="Find" aria-label="Find text"><input id="replace-input" type="text" placeholder="Replace with" aria-label="Replace text"><button class="button button-ghost small-button" id="replace-button">Replace</button><button class="button button-ghost small-button" id="replace-all-button">All</button><button class="icon-button small" id="close-find" aria-label="Close find and replace">×</button></div>
+            <div class="editor-footer"><span><span class="online-dot"></span> Ready to run</span><span id="cursor-position">Ln 1, Col 1</span><span>UTF-8</span></div>
+          </section>
+
+          <aside class="right-rail">
+            <section class="panel run-panel compact-panel"><div class="panel-header"><div><span class="panel-kicker">1 · RUN</span><h3>Try your code</h3></div><span class="api-badge" id="api-badge">API ready</span></div><div class="run-controls"><button class="button button-primary run-button" id="run-button"><span>▶</span> Run</button><button class="button button-secondary" id="analyze-button">Explain</button><button class="button button-secondary" id="verify-button">Check</button></div><div class="run-meta"><span id="run-status">Waiting for your code</span><span id="run-time">—</span></div><div class="offline-note" id="offline-note"><span>◌</span> Offline fallback available for this Python subset</div></section>
+            <section class="panel trace-panel selected-step-panel"><div class="panel-header compact"><div><span class="panel-kicker">2 · SELECTED STEP</span><h3 id="event-title">No event selected</h3></div><span class="trace-badge" id="event-type">Unknown</span></div><div class="trace-meta" id="event-meta">Run the program to inspect an execution event.</div><div class="trace-block"><span class="trace-label">This line</span><pre id="event-source">Unknown source</pre></div><div class="trace-block"><span class="trace-label">What happened</span><p id="event-explanation">Unknown behavior — no execution event is selected.</p></div></section>
+          </aside>
+        </div>
+
+        <div class="workspace-drawer" aria-label="Execution details">
+          <section class="panel drawer-card flow-panel"><div class="panel-header compact"><div><span class="panel-kicker">3 · TIMELINE</span><h3>Execution path</h3></div><button class="icon-button small" id="reset-timeline" title="Reset timeline">↺</button></div><div class="flow-map" id="flow-map"><div class="flow-empty">Run the program to build a trace from returned events.</div></div><div class="timeline"><button class="timeline-button" id="previous-step" aria-label="Previous step">‹</button><button class="play-button" id="play-button" aria-label="Play timeline">▶</button><button class="timeline-button" id="next-step" aria-label="Next step">›</button><div class="timeline-track"><div class="timeline-progress" id="timeline-progress"></div><div class="timeline-thumb" id="timeline-thumb"></div></div><span id="step-count">0 / 0</span><button class="button button-ghost sound-button" id="sound-toggle" type="button" aria-pressed="false" aria-describedby="sound-status">🔇 Sound off</button><span id="sound-status" role="status" aria-live="polite">Sound off · enable to hear trace steps</span></div></section>
+
+          <section class="panel drawer-card data-panel"><div class="panel-header compact"><div><span class="panel-kicker">4 · STATE</span><h3>Variables</h3></div><span class="count-badge" id="variable-count">0</span></div><div class="data-list" id="variables-list"><div class="data-row empty-row"><span class="data-type">—</span><b>No event data</b><code>run code first</code></div></div><div class="sub-panel-heading">Changed in this step</div><div class="data-list changed-list" id="changed-variables"><div class="data-row empty-row"><span class="data-type">—</span><b>Unknown</b><code>no event selected</code></div></div><div class="stack-summary"><div class="sub-panel-heading">Call stack <span class="stack-state" id="stack-state">Unknown</span></div><div class="stack-list" id="stack-list"><div class="stack-row current"><span class="stack-icon">↳</span><div><b>Unknown</b><small>No call-stack data returned.</small></div></div></div></div></section>
+
+          <section class="panel drawer-card console-panel"><div class="panel-header compact"><div><span class="panel-kicker">5 · OUTPUT</span><h3>Console</h3></div><button class="text-button" id="clear-console">Clear</button></div><div class="console-output" id="console-output"><div class="console-line muted-line"><span>›</span> <span>Run the program to see output here</span></div></div><div class="event-output-inline"><div class="inline-heading"><span>Selected output</span><span class="trace-badge" id="event-output-status">Unknown</span></div><div class="console-output" id="event-output"><div class="console-line muted-line"><span>›</span> <span>No output recorded for this event.</span></div></div></div></section>
+
+          <section class="panel drawer-card diagnostics-panel"><div class="panel-header compact"><div><span class="panel-kicker">CHECK</span><h3>Diagnostics</h3></div><span class="diagnostic-ok" id="diagnostic-status">● No issues</span></div><div class="diagnostics-output" id="diagnostics-output"><div class="diagnostic-line"><span class="check">✓</span><div><b>Code looks good</b><small>Ready to execute your Python program.</small></div></div></div></section>
+        </div>
+      </section>
+
+      <section class="ai-section page-section" id="learn"><div class="ai-card glass-card"><div class="ai-icon">✦</div><div class="ai-copy"><div class="eyebrow">FLOWMIND AI</div><h2>Get unstuck, faster.</h2><p>Ask about the code you’re looking at. Get a plain-English explanation, a hint, or a next step without leaving the flow.</p><div class="suggestion-chips"><button class="chip" data-prompt="Explain this code simply">Explain this code</button><button class="chip" data-prompt="Give me a hint">Give me a hint</button><button class="chip" data-prompt="What should I try next?">What next?</button></div></div><div class="ai-chat"><div class="ai-provider-badge not-configured" id="ai-provider-status">Not configured</div><div class="chat-message"><span class="ai-avatar">✦</span><p id="ai-response">Hi! I’m ready to help you understand this code.</p></div><div class="ai-proposal hidden" id="ai-proposal"></div><div class="chat-input"><input id="ai-input" placeholder="Ask FlowMind anything..." aria-label="Ask FlowMind"><button class="button button-primary" id="ai-button" aria-label="Ask FlowMind">↑</button></div><span class="ai-status" id="ai-status">Configure a provider to receive a remote AI answer.</span></div></div></section>
+      <section class="lower-sections page-section" id="examples"><div class="section-heading"><div><div class="eyebrow">KEEP EXPLORING</div><h2>Learn by doing.</h2></div><a class="text-link" href="#challenges">View all challenges <span>→</span></a></div><div class="card-grid"><article class="learning-card"><span class="card-number">01</span><h3>Recursion, visualized</h3><p>Trace a function as it calls itself and watch the stack grow.</p><a href="#visualizer" class="card-link" data-example="recursion">Try example <span>→</span></a></article><article class="learning-card featured"><span class="card-number">02</span><h3>Loops under the microscope</h3><p>Follow every iteration and see exactly when values change.</p><a href="#visualizer" class="card-link" data-example="loops">Try example <span>→</span></a></article><article class="learning-card"><span class="card-number">03</span><h3>Debug with confidence</h3><p>Spot the mismatch, inspect a variable, and make the fix.</p><a href="#visualizer" class="card-link" data-example="debug">Try example <span>→</span></a></article></div></section>
+      <section class="challenge-strip page-section" id="challenges"><div><div class="eyebrow">WEEKLY CHALLENGE</div><h2>Can you find the hidden step?</h2><p>Use the visualizer to solve a tiny mystery and sharpen your debugging instincts.</p></div><button class="button button-primary" id="challenge-button">Start challenge <span>→</span></button></section>
+    </main>
+    <footer class="footer"><span>© 2024 CodeFlow</span><span>Made for curious minds</span><span class="footer-links"><a href="#learn">Documentation</a><a href="#home">Privacy</a><a href="#home">Status <i class="status-dot"></i></a></span></footer>
+  </div>
+  <input type="file" id="file-input" accept=".py,.js,.txt" hidden>
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <script src="app.js"></script>
+</body>
+</html>
