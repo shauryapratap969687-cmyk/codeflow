@@ -10,6 +10,7 @@ for (const file of required) {
 const html = fs.readFileSync(path.join(root, 'index.html'), 'utf8');
 const js = fs.readFileSync(path.join(root, 'app.js'), 'utf8');
 const backend = fs.readFileSync(path.join(root, 'backend.py'), 'utf8');
+const css = fs.readFileSync(path.join(root, 'styles.css'), 'utf8');
 const checks = [
   ['editor', html.includes('id="code-editor"')],
   ['responsive viewport', html.includes('name="viewport"')],
@@ -33,7 +34,8 @@ const checks = [
   ['share and heat controls', html.includes('id="share-button"') && html.includes('id="line-heat-summary"') && js.includes('shareHashFor') && js.includes('lineHeatFromEvents')],
   ['demo gallery', ['buggy-sum', 'fibonacci', 'bubble-sort', 'string-reversal', 'list-dict', 'runtime-error'].every((name) => html.includes(`data-example="${name}"`) && (js.includes(`'${name}'`) || js.includes(`${name}:`)))],
   ['waking message', js.includes('Server is waking up (free hosting)') && js.includes('4000')],
-  ['demo query', js.includes("params.get('demo')") && js.includes("loadExample('buggy-sum')")]
+  ['demo query', js.includes("params.get('demo')") && js.includes("loadExample('buggy-sum')")],
+  ['panel content room', css.includes('.workspace-grid') && css.includes('height: 560px') && css.includes('height: 420px') && css.includes('.data-panel, .diagnostics-panel { overflow-y: auto; }')]
 ];
 if (/coldchain|cold-chain/i.test(html + js + backend)) throw new Error('Standalone folder contains an unrelated product reference');
 const failed = checks.filter(([, passed]) => !passed);

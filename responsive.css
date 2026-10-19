@@ -51,7 +51,7 @@ html, body { min-width: 0; overflow-x: hidden; }
   .workspace-drawer {
     grid-template-columns: minmax(0, 1.05fr) minmax(180px, .8fr) minmax(260px, 1.45fr);
     grid-template-rows: repeat(2, minmax(0, 1fr));
-    height: 286px;
+    height: 420px;
   }
   .flow-panel { grid-column: 1; grid-row: 1 / span 2; }
   .data-panel { grid-column: 2; grid-row: 1; }
