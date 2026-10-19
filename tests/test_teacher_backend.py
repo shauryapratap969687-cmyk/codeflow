@@ -125,6 +125,16 @@ print(total)
         self.assertEqual(update["before_variables"]["value"], 2)
         self.assertEqual(update["after_variables"]["value"], 5)
 
+    def test_trace_types_preserve_collection_kinds(self):
+        result = run("items = [1, 2]\ncoords = (1, 2)\nunique = {1, 2}\nlookup = {'x': 1}\ntext = 'ok'\nprint(items)")
+        assignment_events = {event["line"]: event for event in result["events"] if event["type"] == "line"}
+        self.assertEqual(assignment_events[1]["after_types"]["items"], "list")
+        self.assertEqual(assignment_events[2]["after_types"]["coords"], "tuple")
+        self.assertEqual(assignment_events[3]["after_types"]["unique"], "set")
+        self.assertEqual(assignment_events[4]["after_types"]["lookup"], "dict")
+        self.assertEqual(assignment_events[5]["after_types"]["text"], "str")
+        self.assertIn("items", assignment_events[1]["after_types"])
+
     def test_ten_arbitrary_programs_keep_trace_evidence(self):
         programs = [
             ("answer = 6 * 7\nprint(answer)", "42"),

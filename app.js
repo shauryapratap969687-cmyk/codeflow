@@ -702,6 +702,79 @@
     return changes;
   }
 
+  function typeMapFor(event, after = false, index = state.step) {
+    if (!event || typeof event !== 'object') return {};
+    const direct = after ? event.after_types : event.types;
+    if (direct && typeof direct === 'object' && !Array.isArray(direct)) return direct;
+    const next = index + 1 < state.trace.length ? state.trace[index + 1] : null;
+    if (after && next && sameTraceScope(event, next) && next.types && typeof next.types === 'object') return next.types;
+    return {};
+  }
+
+  function structureKind(value, typeName) {
+    const normalized = String(typeName || '').toLowerCase();
+    if (['list', 'tuple', 'set', 'dict', 'str', 'int', 'float', 'bool', 'nonetype'].includes(normalized)) return normalized;
+    if (Array.isArray(value)) return 'list';
+    if (value === null) return 'nonetype';
+    if (typeof value === 'string') return 'str';
+    if (typeof value === 'boolean') return 'bool';
+    if (typeof value === 'number') return 'float';
+    if (value && typeof value === 'object') return 'dict';
+    return 'unknown';
+  }
+
+  function structureModel(value, typeName, maxItems = 30) {
+    const kind = structureKind(value, typeName);
+    if (kind === 'list' || kind === 'tuple' || kind === 'set') {
+      const values = Array.isArray(value) ? value : [];
+      return { kind, cells: values.slice(0, maxItems).map((item, index) => ({ key: kind === 'set' ? valueText(item) : `[${index}]`, label: kind === 'set' ? valueText(item) : String(index), value: item })), truncated: values.length > maxItems, total: values.length };
+    }
+    if (kind === 'dict') {
+      const entries = value && typeof value === 'object' && !Array.isArray(value) ? Object.entries(value) : [];
+      return { kind, cells: entries.slice(0, maxItems).map(([key, item]) => ({ key, label: key, value: item })), truncated: entries.length > maxItems, total: entries.length };
+    }
+    if (kind === 'str') {
+      const text = String(value ?? '');
+      return { kind, cells: Array.from(text).slice(0, maxItems).map((item, index) => ({ key: String(index), label: String(index), value: item })), truncated: Array.from(text).length > maxItems, total: Array.from(text).length };
+    }
+    if (['int', 'float', 'bool', 'nonetype'].includes(kind)) return { kind, cells: [{ key: 'value', label: kind === 'nonetype' ? 'None' : kind, value }], truncated: false, total: 1 };
+    return { kind: kind || 'unknown', cells: [{ key: 'value', label: 'repr', value }], truncated: false, total: 1 };
+  }
+
+  function compareStructure(before, after) {
+    const beforeByKey = new Map((before && before.cells || []).map((cell) => [cell.key, cell]));
+    const afterByKey = new Map((after && after.cells || []).map((cell) => [cell.key, cell]));
+    const keys = new Set([...beforeByKey.keys(), ...afterByKey.keys()]);
+    return Array.from(keys).map((key) => {
+      const oldCell = beforeByKey.get(key);
+      const newCell = afterByKey.get(key);
+      const status = !oldCell ? 'added' : !newCell ? 'removed' : deepEqual(oldCell.value, newCell.value) ? 'same' : 'changed';
+      return { key, label: (newCell || oldCell).label, before: oldCell && oldCell.value, after: newCell && newCell.value, status };
+    });
+  }
+
+  function structureVariableFor(event, source, before, after) {
+    const target = targetFor(event, source);
+    if (target && (own(before, target) || own(after, target))) return target;
+    const names = new Set([...Object.keys(before || {}), ...Object.keys(after || {})]);
+    return Array.from(names).find((name) => {
+      const beforeModel = structureModel(before && before[name], typeMapFor(event, false)[name]);
+      const afterModel = structureModel(after && after[name], typeMapFor(event, true)[name]);
+      return ['list', 'tuple', 'set', 'dict', 'str'].includes(beforeModel.kind) || ['list', 'tuple', 'set', 'dict', 'str'].includes(afterModel.kind);
+    }) || '';
+  }
+
+  function structureVisualHtml(name, before, after, beforeType, afterType) {
+    if (!name) return '<div class="journey-unknown">No collection or scalar structure changed in this event.</div>';
+    const beforeModel = structureModel(before, beforeType);
+    const afterModel = structureModel(after, afterType || beforeType);
+    const comparison = compareStructure(beforeModel, afterModel);
+    const kind = afterModel.kind || beforeModel.kind || 'unknown';
+    const cells = comparison.map((cell) => `<span class="structure-cell ${cell.status}" title="${escapeHtml(`${cell.label}: ${cell.status}`)}"><b>${escapeHtml(cell.label)}</b><code>${escapeHtml(valueText(cell.status === 'removed' ? cell.before : cell.after))}</code></span>`).join('');
+    const truncation = afterModel.truncated || beforeModel.truncated ? `<span class="structure-more">+${Math.max(afterModel.total || 0, beforeModel.total || 0) - Math.max(afterModel.cells.length, beforeModel.cells.length)} more</span>` : '';
+    return `<div class="structure-visual"><div class="structure-heading"><b>${escapeHtml(name)}</b><span>${escapeHtml(kind)}${beforeType && afterType && beforeType !== afterType ? ` · ${escapeHtml(beforeType)} → ${escapeHtml(afterType)}` : ''}</span></div><div class="structure-cells ${escapeHtml(kind)}">${cells || '<span class="journey-unknown">No recorded cells.</span>'}${truncation}</div></div>`;
+  }
+
   function targetFor(event, source) {
     if (event && typeof event === 'object') {
       const target = event.target || event.variable || event.name;
@@ -899,16 +972,20 @@
     const info = lineInfoFor(event) || {};
     const before = beforeVariablesFor(event, state.step);
     const after = afterVariablesFor(event);
+    const beforeTypes = typeMapFor(event, false);
+    const afterTypes = typeMapFor(event, true);
     const reads = readNamesFor(event, source, before);
     const target = targetFor(event, source);
     const targetBefore = target && own(before, target) ? before[target] : undefined;
     const targetAfter = target && own(after, target) ? after[target] : undefined;
     const collectionDiff = collectionChanges(targetBefore, targetAfter);
+    const structureName = structureVariableFor(event, source, before, after || {});
+    const structureHtml = structureVisualHtml(structureName, structureName ? before[structureName] : undefined, structureName && after ? after[structureName] : undefined, structureName ? beforeTypes[structureName] : '', structureName ? afterTypes[structureName] : '');
     const readCards = reads.length ? reads.map((name) => `<div class="teacher-read-card"><b>${escapeHtml(name)}</b><code>${escapeHtml(valueText(before[name]))}</code></div>`).join('') : '<div class="journey-unknown">No recorded before-values for read variables.</div>';
     const diff = collectionDiff.length ? `<div class="collection-diff">${collectionDiff.map((change) => `<span><b>${escapeHtml(change.key)}</b> <em>${escapeHtml(valueText(change.before))}</em> → <strong>${escapeHtml(valueText(change.after))}</strong></span>`).join('')}</div>` : '';
     const targetView = target ? `<div class="journey-target"><span>${escapeHtml(target)}</span><code>${escapeHtml(valueText(targetBefore))}</code><b>→</b><code>${escapeHtml(valueText(targetAfter))}</code>${diff}</div>` : '<div class="journey-unknown">No recorded target for this event.</div>';
     const expression = info.expression || info.expr || source || 'Unknown expression';
-    journey.innerHTML = `<div class="journey-section"><span class="trace-label">Value journey</span><div class="journey-line-info"><b>${escapeHtml(info.kind || eventType(event) || 'unknown')}</b><span>${Number.isInteger(eventLine(event)) ? `line ${eventLine(event)}` : 'line Unknown'}</span></div><pre class="journey-source">${escapeHtml(source || 'Unknown source line')}</pre></div><div class="journey-section"><span class="journey-label">Read variables</span><div class="teacher-read-cards">${readCards}</div></div><div class="journey-section"><span class="journey-label">Expression substitution</span><div class="substitution-bar"><code>${textualSubstitution(String(expression), before, reads)}</code></div></div><div class="journey-section"><span class="journey-label">Target / result</span>${targetView}</div>`;
+    journey.innerHTML = `<div class="journey-section"><span class="trace-label">Value journey</span><div class="journey-line-info"><b>${escapeHtml(info.kind || eventType(event) || 'unknown')}</b><span>${Number.isInteger(eventLine(event)) ? `line ${eventLine(event)}` : 'line Unknown'}</span></div><pre class="journey-source">${escapeHtml(source || 'Unknown source line')}</pre></div><div class="journey-section"><span class="journey-label">Read variables</span><div class="teacher-read-cards">${readCards}</div></div><div class="journey-section"><span class="journey-label">Expression substitution</span><div class="substitution-bar"><code>${textualSubstitution(String(expression), before, reads)}</code></div></div><div class="journey-section"><span class="journey-label">Target / result</span>${targetView}</div><div class="journey-section"><span class="journey-label">Data structure</span>${structureHtml}</div>`;
     const sentence = narrate(event, state.trace[state.step + 1], info, source);
     setText('teacher-caption', sentence);
     const detailed = state.teacherMode === 'detailed';
@@ -1563,6 +1640,11 @@
     prepareCallTree,
     layoutCallTree,
     callArgumentsText
+  });
+  window.CodeFlowStructures = Object.freeze({
+    structureKind,
+    structureModel,
+    compareStructure
   });
 
   function replaceText(allMatches) {

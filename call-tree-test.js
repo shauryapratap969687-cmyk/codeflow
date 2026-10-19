@@ -16,6 +16,8 @@ vm.runInNewContext(source, sandbox, { filename: 'app.js' });
 
 const treeApi = sandbox.CodeFlowCallTree;
 if (!treeApi) throw new Error('Call-tree test API was not exposed');
+const structures = sandbox.CodeFlowStructures;
+if (!structures) throw new Error('Structure test API was not exposed');
 
 const events = [
   { type: 'call', function: '<module>', call_stack: ['<module>'], variables: {} },
@@ -43,5 +45,15 @@ if (!layout.positions.size || layout.width < 760 || layout.height < 110) throw n
 
 const empty = treeApi.buildCallTree([{ type: 'call', function: '<module>', call_stack: ['<module>'], variables: {} }]);
 if (empty.hasFunctionCall) throw new Error('Module-only execution should show the friendly empty state');
+
+const beforeList = structures.structureModel([1, 2], 'list');
+const afterList = structures.structureModel([1, 3, 4], 'list');
+if (beforeList.kind !== 'list' || afterList.cells.length !== 3) throw new Error('List structure model was not preserved');
+const listDiff = structures.compareStructure(beforeList, afterList);
+if (!listDiff.some((cell) => cell.key === '[1]' && cell.status === 'changed') || !listDiff.some((cell) => cell.key === '[2]' && cell.status === 'added')) throw new Error('List cell changes were not identified');
+if (structures.structureModel([1, 2], 'tuple').kind !== 'tuple' || structures.structureModel(['a'], 'set').kind !== 'set') throw new Error('Tuple/set type labels were not preserved');
+const dictDiff = structures.compareStructure(structures.structureModel({ x: 1 }, 'dict'), structures.structureModel({ x: 2, y: 3 }, 'dict'));
+if (!dictDiff.some((cell) => cell.key === 'x' && cell.status === 'changed') || !dictDiff.some((cell) => cell.key === 'y' && cell.status === 'added')) throw new Error('Dict cell changes were not identified');
+if (structures.structureModel('abc', 'str').cells.length !== 3) throw new Error('Short strings were not split into characters');
 
 console.log('Call-tree test passed: recursion, returns, repeats, cap, layout, empty state');

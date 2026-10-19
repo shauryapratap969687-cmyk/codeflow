@@ -722,6 +722,25 @@ def snapshot(values):
     return result
 
 
+def type_name(value):
+    """Return a compact type label without inspecting user objects deeply."""
+    if value is None:
+        return "NoneType"
+    try:
+        name = type(value).__name__
+    except BaseException:
+        return "unknown"
+    return str(name)[:80] or "unknown"
+
+
+def snapshot_types(values):
+    result = {}
+    for key, value in list(values.items())[:MAX_VARIABLES]:
+        if not str(key).startswith("__"):
+            result[str(key)] = type_name(value)
+    return result
+
+
 def loop_ranges(source):
     """Find loop spans from syntax; iteration numbers come only from trace visits."""
     try:
@@ -779,6 +798,7 @@ def finalize_previous_event(frame):
     previous = open_events.get(id(frame))
     if previous is not None and previous.get("after_variables") is None:
         previous["after_variables"] = snapshot(frame.f_locals)
+        previous["after_types"] = snapshot_types(frame.f_locals)
 
 
 def trace(frame, event, arg):
@@ -798,6 +818,7 @@ def trace(frame, event, arg):
         recorded = False
         if len(events) < MAX_EVENTS:
             before_variables = snapshot(frame.f_locals)
+            before_types = snapshot_types(frame.f_locals)
             item = {
                 "sequence": len(events),
                 "type": event,
@@ -806,12 +827,15 @@ def trace(frame, event, arg):
                 "variables": before_variables,
                 "before_variables": before_variables,
                 "after_variables": None,
+                "types": before_types,
+                "after_types": None,
                 "call_stack": list(stack[-MAX_STACK:]),
                 "output_delta": output_delta(),
             }
             if event == "return":
                 item["return_value"] = safe_value(arg)
                 item["after_variables"] = before_variables
+                item["after_types"] = before_types
             loop = loop_metadata(frame, frame.f_lineno)
             if loop is not None:
                 item.update(loop)
