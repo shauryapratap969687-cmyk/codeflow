@@ -68,14 +68,14 @@ shows **Not configured** for remote AI.
 
 The backend serves the local frontend and exposes:
 
-- `POST /api/execute` — `{ language, code }` → `{ output, variables, diagnostics }`
+- `POST /api/execute` — `{ language, code }` → `{ output, variables, diagnostics, events, line_info, teacher_mode }`
 - `POST /api/verify` — `{ language, code }` → `{ valid, errors }`
 - `POST /api/ai` — `{ mode, prompt, language, code, diagnostics, selected_event }` → a provider status plus a structured `{ answer, proposed_code? }`
 - `GET /api/health` — backend status and execution capability information
 
 `/api/ai` uses `status: "ok"` with `provider_status: "remote"` for a validated provider answer, `status: "not-configured"` with `configuration_status: "missing"` when no key is present, and `status: "error"` with provider/configuration diagnostics when a configured provider cannot be used. In every non-success case `answer` is `null`.
 
-Python programs run in a bounded child process with captured stdout/stderr, syntax/runtime locations, normalized trace events, variable snapshots, call-stack snapshots, source/output/event limits, and a hard timeout. JavaScript runs in Node.js when it is on `PATH`; otherwise the API returns an explicit unsupported response. The AI endpoint returns `status: "not-configured"` and no answer when `CODEFLOW_AI_API_KEY` is absent. With the variables below, it sends the current code, language, diagnostics, selected trace event, and user prompt to an OpenAI-compatible chat-completions endpoint. The provider must return a JSON object in `message.content` with a non-empty `answer` and may include a bounded `proposed_code` object.
+Python programs run in a bounded child process with captured stdout/stderr, syntax/runtime locations, normalized trace events, explicit before/after variable snapshots, call-stack snapshots, AST-derived `line_info` keyed by source line, loop metadata, source/output/event limits, and a hard timeout. The frontend Teacher mode uses those recorded values for Simple/Detailed value journeys, captions, optional English/Hindi browser speech, and step navigation. JavaScript runs in Node.js when it is on `PATH`, but remains explicitly `teacher_mode: "output-only"` with `trace_supported: false`; it never presents Python-style traced steps. The AI endpoint returns `status: "not-configured"` and no answer when `CODEFLOW_AI_API_KEY` is absent. With the variables below, it sends the current code, language, diagnostics, selected trace event, and user prompt to an OpenAI-compatible chat-completions endpoint. The provider must return a JSON object in `message.content` with a non-empty `answer` and may include a bounded `proposed_code` object.
 
 ### Deployment hardening
 
@@ -124,6 +124,7 @@ For an OpenAI-compatible local provider, replace `CODEFLOW_AI_BASE_URL` and `COD
 - Run, Analyze, Verify, timeline playback, flow map, variables, call stack, console, and diagnostics
 - Compact laptop-first visualizer with a single-screen editor, selected-step explanation, timeline, state, output, and checks
 - Optional Web Audio step feedback with event-specific tones; click **Sound off** once to unlock it, then each selected/playback step is audible
+- Teacher mode with trace-derived Value Journey cards, Simple/Detailed views, English/Hindi captions, browser speech controls, replay, auto-advance, and keyboard navigation
 - FlowMind AI prompt chips and `/api/ai` integration with visible `Remote AI`, `Local fallback`, or `Not configured` provider state
 - Import, export, undo, restore, clear console, examples, challenge loader, and theme toggle
 
@@ -132,7 +133,8 @@ For an OpenAI-compatible local provider, replace `CODEFLOW_AI_BASE_URL` and `COD
 ```bash
 node --check app.js
 node smoke-test.js
+node teacher-test.js
 python -m unittest discover -s tests -v
 ```
 
-The JavaScript smoke test is dependency-free and checks the static entry point. The Python tests exercise execution, limits/diagnostics, verification, JavaScript capability handling, missing AI credentials, a mocked structured provider response with a proposed code change, sandbox boundaries, rate limits, result-size robustness, and static-file exposure. The hardening suite is in `tests/test_hardening.py`.
+The JavaScript smoke test is dependency-free and checks the static entry point. `teacher-test.js` loads the actual browser bundle in a small VM harness and verifies non-empty, value-preserving narration for ten arbitrary trace shapes plus Hindi output. The Python tests exercise execution, Teacher metadata and ten arbitrary programs, limits/diagnostics, verification, JavaScript capability handling, missing AI credentials, a mocked structured provider response with a proposed code change, sandbox boundaries, rate limits, result-size robustness, and static-file exposure. The hardening suite is in `tests/test_hardening.py`.

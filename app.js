@@ -24,7 +24,16 @@
     animationFrame: null,
     animationToken: 0,
     soundPulseToken: 0,
-    playbackToken: 0
+    playbackToken: 0,
+    teacherMode: 'simple',
+    teacherLanguage: 'en',
+    teacherSpeed: 1,
+    teacherAutoAdvance: false,
+    teacherVoice: '',
+    speechVoices: [],
+    speechSupported: false,
+    speechPlaying: false,
+    speechToken: 0
   };
 
   const $ = (id) => document.getElementById(id);
@@ -405,7 +414,10 @@
   }
 
   function eventType(event) {
-    const rawValue = String(event && typeof event === 'object' ? (event.type || event.event || event.kind || '') : '');
+    const supplied = event && typeof event === 'object' ? (event.type || event.event || '') : '';
+    const inferredInfo = supplied === 'line' ? lineInfoFor(event) : null;
+    const inferredKind = inferredInfo && inferredInfo.calls && inferredInfo.calls.includes('print') && event && event.output_delta ? 'stdout' : inferredInfo && inferredInfo.kind;
+    const rawValue = String(supplied === 'line' && inferredKind ? inferredKind : (supplied || (event && event.line_info && event.line_info.kind) || (event && event.kind) || ''));
     const method = String(event && typeof event === 'object' ? (event.method || event.operation || '') : '').trim().toLowerCase();
     const raw = rawValue.replace(/[._-]/g, ' ').trim().toLowerCase();
     if (!raw) return 'unknown';
@@ -415,11 +427,18 @@
     if (raw === 'console warn' || raw === 'console error' || raw === 'stderr' || raw === 'warning') return 'stderr';
     if (raw === 'throw' || raw === 'thrown' || raw === 'uncaught') return 'exception';
     if (raw === 'step' || raw === 'statement' || raw === 'execution') return 'line';
+    if (/aug.?assign|in.?place|update/.test(raw)) return 'augassign';
+    if (/assign|assignment|store/.test(raw)) return 'assignment';
+    if (/call|invoke|function/.test(raw)) return 'call';
+    if (/loop|for|while|iteration|iter/.test(raw)) return 'loop';
+    if (/condition|if|branch|test/.test(raw)) return 'condition';
+    if (/end.?program|program.?end|complete|done/.test(raw)) return 'end-of-program';
+    if (/truncate|limit/.test(raw)) return 'truncated';
     return raw;
   }
 
   function eventLine(event) {
-    const value = event && typeof event === 'object' ? (event.line ?? event.lineNumber ?? event.lineno ?? event.location?.line) : undefined;
+    const value = event && typeof event === 'object' ? (event.line ?? event.lineNumber ?? event.lineno ?? event.location?.line ?? event.line_info?.line ?? event.line_info?.line_number) : undefined;
     const line = Number(value);
     return Number.isInteger(line) && line > 0 ? line : null;
   }
@@ -450,12 +469,147 @@
     if (typeof event.source_code === 'string') return event.source_code;
     if (typeof event.source === 'string') return event.source;
     if (typeof event.code === 'string') return event.code;
+    const info = lineInfoFor(event);
+    if (info && typeof (info.source || info.source_line || info.code) === 'string') return info.source || info.source_line || info.code;
     return '';
   }
 
+  function lineInfoFor(event) {
+    const direct = event && typeof event === 'object' ? event.line_info : null;
+    if (direct && typeof direct === 'object') return direct;
+    const allInfo = state.lastResult && state.lastResult.line_info;
+    const line = eventLine(event);
+    if (Array.isArray(allInfo)) return allInfo.find((item) => Number(item && (item.line ?? item.line_number)) === line) || null;
+    if (allInfo && typeof allInfo === 'object') return allInfo[line] || allInfo[String(line)] || null;
+    return null;
+  }
+
+  function own(object, key) { return Boolean(object && Object.prototype.hasOwnProperty.call(object, key)); }
+
+  function beforeVariablesFor(event, index) {
+    if (!event || typeof event !== 'object') return {};
+    const explicit = event.before_variables || event.variables_before || event.before || event.previous_variables;
+    if (explicit && typeof explicit === 'object' && !Array.isArray(explicit)) return explicit;
+    const previous = index > 0 ? eventVariables(state.trace[index - 1]) : null;
+    return previous && sameTraceScope(state.trace[index - 1], event) ? previous : {};
+  }
+
+  function sameTraceScope(first, second) {
+    if (!first || !second) return false;
+    if (first.scope_id !== undefined && second.scope_id !== undefined) return first.scope_id === second.scope_id;
+    if (first.function && second.function && first.function !== second.function) return false;
+    const firstStack = first.call_stack || first.stack;
+    const secondStack = second.call_stack || second.stack;
+    if (Array.isArray(firstStack) && Array.isArray(secondStack)) return JSON.stringify(firstStack) === JSON.stringify(secondStack);
+    return Boolean(first.function && second.function && first.function === second.function);
+  }
+
+  function afterVariablesFor(event, index) {
+    if (!event || typeof event !== 'object') return null;
+    const explicit = event.after_variables || event.variables_after || event.after || event.next_variables;
+    if (explicit && typeof explicit === 'object' && !Array.isArray(explicit)) return explicit;
+    const next = index + 1 < state.trace.length ? state.trace[index + 1] : null;
+    if (next && sameTraceScope(event, next)) return beforeVariablesFor(next, index + 1);
+    return null;
+  }
+
+  function readNamesFor(event, source, before) {
+    const info = lineInfoFor(event) || {};
+    const explicit = event && (event.read_variables || event.reads || event.used_variables) || info.read_variables || info.reads;
+    const names = Array.isArray(explicit) ? explicit.map(String) : explicit && typeof explicit === 'object' ? Object.keys(explicit) : [];
+    if (names.length) return Array.from(new Set(names));
+    const line = String(source || '');
+    const rhs = line.includes('=') ? line.slice(line.indexOf('=') + 1) : line;
+    const candidates = rhs.match(/[A-Za-z_$][\w$]*/g) || [];
+    const keywords = new Set(['and', 'as', 'await', 'def', 'else', 'False', 'for', 'from', 'if', 'in', 'is', 'None', 'not', 'or', 'True', 'while', 'return']);
+    return Array.from(new Set(candidates.filter((name) => !keywords.has(name) && own(before, name))));
+  }
+
+  function textualSubstitution(source, before, readNames) {
+    const text = String(source || '');
+    const names = Array.from(new Set(readNames || [])).filter((name) => own(before, name)).sort((a, b) => b.length - a.length);
+    if (!text || !names.length) return escapeHtml(text || 'Unknown expression');
+    const pattern = new RegExp(`\\b(${names.map((name) => name.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&')).join('|')})\\b`, 'g');
+    let cursor = 0;
+    let html = '';
+    text.replace(pattern, (match, name, offset) => {
+      html += escapeHtml(text.slice(cursor, offset));
+      html += `<mark class="substitution" title="${escapeHtml(valueText(before[name]))}">${escapeHtml(valueText(before[name]))}</mark>`;
+      cursor = offset + match.length;
+      return match;
+    });
+    return html + escapeHtml(text.slice(cursor));
+  }
+
+  function deepEqual(a, b) {
+    try { return JSON.stringify(a) === JSON.stringify(b); } catch (_) { return valueText(a) === valueText(b); }
+  }
+
+  function collectionChanges(before, after) {
+    const changes = [];
+    if (Array.isArray(before) && Array.isArray(after)) {
+      const size = Math.max(before.length, after.length);
+      for (let index = 0; index < size; index += 1) if (!deepEqual(before[index], after[index])) changes.push({ key: `[${index}]`, before: before[index], after: after[index] });
+    } else if (before && after && typeof before === 'object' && typeof after === 'object' && !Array.isArray(before) && !Array.isArray(after)) {
+      const keys = new Set([...Object.keys(before), ...Object.keys(after)]);
+      keys.forEach((key) => { if (!deepEqual(before[key], after[key])) changes.push({ key, before: own(before, key) ? before[key] : undefined, after: own(after, key) ? after[key] : undefined }); });
+    }
+    return changes;
+  }
+
+  function targetFor(event, source) {
+    if (event && typeof event === 'object') {
+      const target = event.target || event.variable || event.name;
+      if (typeof target === 'string' && target.trim()) return target.trim();
+    }
+    const match = String(source || '').match(/^\s*([A-Za-z_$][\w$]*(?:\s*\[[^\]]+\])?)\s*(?:\+=|-=|\*=|\/=|%=|=)/);
+    return match ? match[1] : '';
+  }
+
+  function narrationForLanguage(event, nextEvent, lineInfo, source, language, suppliedBefore, suppliedAfter) {
+    const type = eventType(event).toLowerCase();
+    const line = eventLine(event);
+    const location = Number.isInteger(line) ? (language === 'hi' ? ` पंक्ति ${line} पर` : ` on line ${line}`) : '';
+    const target = targetFor(event, source);
+    const after = suppliedAfter || afterVariablesFor(event, state.step) || (nextEvent && sameTraceScope(event, nextEvent) ? beforeVariablesFor(nextEvent, state.step + 1) : null);
+    const before = suppliedBefore || beforeVariablesFor(event, state.step);
+    const hasBefore = before && typeof before === 'object';
+    const hasAfter = after && typeof after === 'object';
+    const value = target && own(after, target) ? valueText(after[target]) : '';
+    const output = event && (event.output ?? event.value ?? event.text ?? event.stdout ?? event.output_delta);
+    const functionName = event && (event.function || event.name);
+    const beforeValue = target && hasBefore && own(before, target) ? valueText(before[target]) : '';
+    const afterValue = target && hasAfter && own(after, target) ? valueText(after[target]) : '';
+    const transition = beforeValue && afterValue ? ` from ${beforeValue} to ${afterValue}` : afterValue ? `; its recorded value is ${afterValue}` : '';
+    if (type === 'assignment') return language === 'hi' ? `${target || 'एक मान'} को${location} दर्ज किया गया${afterValue ? `; दर्ज मान ${afterValue} है` : '।'}` : `${target || 'A value'} was assigned${location}${transition}.`;
+    if (type === 'augassign') return language === 'hi' ? `${target || 'एक मान'} को${location} बदला गया${beforeValue && afterValue ? `: ${beforeValue} से ${afterValue}` : ''}।` : `${target || 'A value'} was updated${location}${transition}; only recorded values are shown.`;
+    if (type === 'call') return language === 'hi' ? `${functionName ? `फ़ंक्शन ${functionName}` : 'एक फ़ंक्शन'} में प्रवेश किया गया${location}।` : `Entered ${functionName ? `function ${functionName}` : 'a function'}${location}.`;
+    if (type === 'return') {
+      const returned = event && (event.return_value ?? event.returnValue ?? event.value);
+      return language === 'hi' ? `${functionName ? `फ़ंक्शन ${functionName} से` : 'वर्तमान फ़ंक्शन से'} लौटे${location}${returned === undefined ? '' : `; लौटाया गया मान ${valueText(returned)} है`}।` : `Returned ${returned === undefined ? 'from the current function' : valueText(returned)}${location}.`;
+    }
+    if (type === 'loop') {
+      const iteration = event && event.loop_iteration;
+      const count = Number.isInteger(iteration) ? (language === 'hi' ? ` यह पुनरावृत्ति ${iteration} है` : `; this is iteration ${iteration}`) : '';
+      return language === 'hi' ? `लूप का यह चरण${location}${count} रिकॉर्ड किया गया है।` : `This loop step${location}${count} was recorded.`;
+    }
+    if (type === 'condition') return language === 'hi' ? `शर्त${location} जांची गई; परिणाम का मान ट्रेस में जितना है उतना ही दिखाया गया है।` : `The condition${location} was checked; the trace shows only the recorded result.`;
+    if (type === 'stdout' || type === 'output') return language === 'hi' ? `प्रोग्राम ने${location} आउटपुट लिखा${output === undefined ? '' : `: ${valueText(output)}`}।` : `The program wrote output${location}${output === undefined ? '' : `: ${valueText(output)}`}.`;
+    if (type === 'stderr' || type === 'exception' || type === 'error') return language === 'hi' ? `एक त्रुटि घटना${location} रिकॉर्ड हुई${event && (event.exception || event.error || event.message) ? `: ${event.exception || event.error || event.message}` : '।'}` : `An error event${location} was recorded${event && (event.exception || event.error || event.message) ? `: ${event.exception || event.error || event.message}` : '.'}`;
+    if (type === 'unknown' || !type) return language === 'hi' ? `यह चरण${location} रिकॉर्ड हुआ; घटना का प्रकार उपलब्ध नहीं है।` : `This step${location} was recorded; its event kind is unknown.`;
+    if (type === 'truncated' || (state.lastResult && state.lastResult.events_truncated && !nextEvent)) return language === 'hi' ? 'ट्रेस सीमित है; कुछ घटनाएँ दिखाई नहीं गईं।' : 'The trace is truncated; some events are not shown.';
+    if (type === 'end-of-program' || !nextEvent) return language === 'hi' ? 'प्रोग्राम का रिकॉर्ड किया गया भाग समाप्त हुआ।' : 'The recorded part of the program ended.';
+    if (type === 'line') return language === 'hi' ? `यह स्रोत पंक्ति${location} चली; ट्रेस में कोई अधिक विशिष्ट प्रकार नहीं है।` : `This source line${location} ran; the trace has no more specific kind.`;
+    return language === 'hi' ? `यह एक सामान्य निष्पादन घटना${location} है।` : `This is a generic execution event${location}.`;
+  }
+
+  function narrate(event, nextEvent, lineInfo, source) {
+    return narrationForLanguage(event, nextEvent, lineInfo, source, state.teacherLanguage || 'en');
+  }
+
   function changedVariables(index) {
-    const current = eventVariables(state.trace[index]);
-    const previous = index > 0 ? eventVariables(state.trace[index - 1]) : {};
+    const current = afterVariablesFor(state.trace[index], index) || {};
+    const previous = beforeVariablesFor(state.trace[index], index);
     const names = new Set([...Object.keys(previous), ...Object.keys(current)]);
     return Array.from(names).filter((name) => valueText(previous[name]) !== valueText(current[name])).map((name) => ({
       name,
@@ -487,6 +641,20 @@
       const output = event && (event.output ?? event.value ?? event.text ?? event.error);
       return output === undefined ? `The program wrote an error stream event${location}; its text is unknown.` : `The program wrote ${valueText(output)} to the error stream${location}.`;
     }
+    if (type === 'assignment' || type === 'augassign') {
+      const info = lineInfoFor(event) || {};
+      const target = targetFor(event, sourceLineForEvent(event));
+      const after = afterVariablesFor(event, state.step);
+      const before = beforeVariablesFor(event, state.step);
+      if (target && own(before, target) && after && own(after, target)) return `${target} changed from ${valueText(before[target])} to ${valueText(after[target])}${location}.`;
+      if (target && after && own(after, target)) return `${target} was assigned the recorded value ${valueText(after[target])}${location}.`;
+      return `${info.kind || type} was recorded${location}; before or after values are unavailable.`;
+    }
+    if (type === 'loop') {
+      const iteration = event && event.loop_iteration;
+      return Number.isInteger(iteration) ? `Loop iteration ${iteration} was recorded${location}.` : `A loop step was recorded${location}; iteration count is unavailable.`;
+    }
+    if (type === 'condition') return `The condition was checked${location}; the trace does not include a separate boolean result.`;
     if (type === 'line') {
       if (changes.length) return `Executed the source line${location}; ${changes.map((change) => change.removed ? `${change.name} was removed` : `${change.name} changed to ${valueText(change.after)}`).join(', ')}.`;
       return `Executed the source line${location}; no variable changes were recorded for this event.`;
@@ -495,6 +663,7 @@
   }
 
   function renderTrace(result, source) {
+    cancelSpeech();
     stopPlayback();
     const returnedEvents = Array.isArray(result && result.events) && result.events.length
       ? result.events
@@ -519,6 +688,112 @@
     updateTimeline();
   }
 
+  function renderTeacherJourney(event) {
+    const journey = $('value-journey');
+    if (!journey) return;
+    if (!event) {
+      journey.innerHTML = '<div class="journey-empty">Select a trace step to see its recorded value journey.</div>';
+      setText('teacher-caption', 'Run the program and select a step to hear its explanation.');
+      return;
+    }
+    const source = sourceLineForEvent(event);
+    const info = lineInfoFor(event) || {};
+    const before = beforeVariablesFor(event, state.step);
+    const after = afterVariablesFor(event);
+    const reads = readNamesFor(event, source, before);
+    const target = targetFor(event, source);
+    const targetBefore = target && own(before, target) ? before[target] : undefined;
+    const targetAfter = target && own(after, target) ? after[target] : undefined;
+    const collectionDiff = collectionChanges(targetBefore, targetAfter);
+    const readCards = reads.length ? reads.map((name) => `<div class="teacher-read-card"><b>${escapeHtml(name)}</b><code>${escapeHtml(valueText(before[name]))}</code></div>`).join('') : '<div class="journey-unknown">No recorded before-values for read variables.</div>';
+    const diff = collectionDiff.length ? `<div class="collection-diff">${collectionDiff.map((change) => `<span><b>${escapeHtml(change.key)}</b> <em>${escapeHtml(valueText(change.before))}</em> → <strong>${escapeHtml(valueText(change.after))}</strong></span>`).join('')}</div>` : '';
+    const targetView = target ? `<div class="journey-target"><span>${escapeHtml(target)}</span><code>${escapeHtml(valueText(targetBefore))}</code><b>→</b><code>${escapeHtml(valueText(targetAfter))}</code>${diff}</div>` : '<div class="journey-unknown">No recorded target for this event.</div>';
+    const expression = info.expression || info.expr || source || 'Unknown expression';
+    journey.innerHTML = `<div class="journey-section"><span class="trace-label">Value journey</span><div class="journey-line-info"><b>${escapeHtml(info.kind || eventType(event) || 'unknown')}</b><span>${Number.isInteger(eventLine(event)) ? `line ${eventLine(event)}` : 'line Unknown'}</span></div><pre class="journey-source">${escapeHtml(source || 'Unknown source line')}</pre></div><div class="journey-section"><span class="journey-label">Read variables</span><div class="teacher-read-cards">${readCards}</div></div><div class="journey-section"><span class="journey-label">Expression substitution</span><div class="substitution-bar"><code>${textualSubstitution(String(expression), before, reads)}</code></div></div><div class="journey-section"><span class="journey-label">Target / result</span>${targetView}</div>`;
+    const sentence = narrate(event, state.trace[state.step + 1], info, source);
+    setText('teacher-caption', sentence);
+    const detailed = state.teacherMode === 'detailed';
+    journey.classList.toggle('teacher-detailed', detailed);
+    journey.querySelectorAll('.journey-section').forEach((section, index) => section.classList.toggle('teacher-detail-section', index > 0));
+  }
+
+  function cancelSpeech() {
+    state.speechToken += 1;
+    state.speechPlaying = false;
+    if (window.speechSynthesis) window.speechSynthesis.cancel();
+    const button = $('teacher-play');
+    if (button) button.textContent = '▶ Play';
+  }
+
+  function speechUtterance() {
+    const event = state.trace[state.step];
+    if (!event) return null;
+    const sentence = narrate(event, state.trace[state.step + 1], lineInfoFor(event), sourceLineForEvent(event));
+    setText('teacher-caption', sentence);
+    if (!state.speechSupported) return null;
+    const utterance = new SpeechSynthesisUtterance(sentence);
+    utterance.lang = state.teacherLanguage === 'hi' ? 'hi-IN' : 'en-US';
+    utterance.rate = state.teacherSpeed;
+    const voice = state.speechVoices.find((item) => item.name === state.teacherVoice);
+    if (voice) utterance.voice = voice;
+    return utterance;
+  }
+
+  function speakCurrent(replay = false) {
+    if (!state.trace.length) { setText('teacher-caption', 'Run the program and select a step to hear its explanation.'); return; }
+    if (!state.speechSupported) { setText('teacher-caption', narrate(state.trace[state.step], state.trace[state.step + 1], lineInfoFor(state.trace[state.step]), sourceLineForEvent(state.trace[state.step]))); showToast('Speech is unavailable; captions remain enabled.'); return; }
+    cancelSpeech();
+    const utterance = speechUtterance();
+    if (!utterance) return;
+    const token = state.speechToken;
+    utterance.onstart = () => { if (token === state.speechToken) { state.speechPlaying = true; setText('teacher-play', 'Ⅱ Pause'); } };
+    utterance.onend = () => {
+      if (token !== state.speechToken) return;
+      state.speechPlaying = false;
+      setText('teacher-play', '▶ Play');
+      if (state.teacherAutoAdvance && state.step < state.trace.length - 1) {
+        selectTimelineStep(state.step + 1, false, 'speech');
+        window.setTimeout(() => speakCurrent(), 40);
+      }
+    };
+    utterance.onerror = () => { if (token === state.speechToken) { state.speechPlaying = false; setText('teacher-play', '▶ Play'); } };
+    window.speechSynthesis.speak(utterance);
+  }
+
+  function populateSpeechVoices() {
+    if (!window.speechSynthesis) return;
+    state.speechVoices = window.speechSynthesis.getVoices().filter((voice) => voice && voice.name);
+    const select = $('teacher-voice');
+    if (!select) return;
+    const selected = state.teacherVoice;
+    select.innerHTML = '<option value="">System default</option>' + state.speechVoices.map((voice) => `<option value="${escapeHtml(voice.name)}">${escapeHtml(voice.name)}${voice.lang ? ` · ${escapeHtml(voice.lang)}` : ''}</option>`).join('');
+    if (state.speechVoices.some((voice) => voice.name === selected)) select.value = selected;
+  }
+
+  function configureTeacherSpeech() {
+    state.speechSupported = Boolean(window.speechSynthesis && window.SpeechSynthesisUtterance);
+    try {
+      state.teacherMode = localStorage.getItem('codeflow.teacher.mode') || 'simple';
+      state.teacherLanguage = localStorage.getItem('codeflow.teacher.language') || 'en';
+      state.teacherSpeed = Number(localStorage.getItem('codeflow.teacher.speed')) || 1;
+      state.teacherVoice = localStorage.getItem('codeflow.teacher.voice') || '';
+      state.teacherAutoAdvance = localStorage.getItem('codeflow.teacher.auto') === 'true';
+    } catch (_) { /* preferences are optional */ }
+    state.teacherMode = state.teacherMode === 'detailed' ? 'detailed' : 'simple';
+    state.teacherLanguage = state.teacherLanguage === 'hi' ? 'hi' : 'en';
+    state.teacherSpeed = Math.max(.8, Math.min(1.3, state.teacherSpeed));
+    if ($('teacher-language')) $('teacher-language').value = state.teacherLanguage;
+    if ($('teacher-speed')) $('teacher-speed').value = String(state.teacherSpeed);
+    if ($('teacher-auto-advance')) $('teacher-auto-advance').checked = state.teacherAutoAdvance;
+    if ($('teacher-simple')) $('teacher-simple').classList.toggle('active', state.teacherMode !== 'detailed');
+    if ($('teacher-detailed')) $('teacher-detailed').classList.toggle('active', state.teacherMode === 'detailed');
+    if (window.speechSynthesis) {
+      populateSpeechVoices();
+      window.speechSynthesis.addEventListener('voiceschanged', populateSpeechVoices);
+    }
+    if (!state.speechSupported) setText('teacher-caption', 'Speech is unavailable in this browser; captions remain enabled.');
+  }
+
   function renderSelectedEvent() {
     const event = state.trace[state.step];
     if (!event) {
@@ -535,6 +810,7 @@
       renderChangedVariables([]);
       renderStack(state.lastResult && state.lastResult.call_stack);
       renderEventOutput(null);
+      renderTeacherJourney(null);
       return;
     }
     const changes = changedVariables(state.step);
@@ -556,6 +832,7 @@
     renderChangedVariables(changes);
     renderStack(event.call_stack || event.stack);
     renderEventOutput(event);
+    renderTeacherJourney(event);
     if (line) setText('run-status', `Viewing line ${line} · ${type}`);
     animateSelectedStep();
   }
@@ -817,6 +1094,7 @@
   }
 
   function selectTimelineStep(step, playSound = false, source = 'manual') {
+    cancelSpeech();
     if (source !== 'playback') stopPlayback();
     const length = all('.flow-step').length;
     if (!length) return;
@@ -922,6 +1200,29 @@
     }
   }
 
+  async function explainMore() {
+    const event = state.trace[state.step];
+    if (!event) { showToast('Select a trace step first.'); return; }
+    const source = sourceLineForEvent(event);
+    const payload = {
+      ...aiContext('Explain the selected execution step using only the supplied trace evidence.'),
+      mode: 'teacher',
+      selected_event: event,
+      line_info: lineInfoFor(event),
+      source_line: source
+    };
+    setText('teacher-caption', 'Asking FlowMind for an evidence-based explanation…');
+    const result = await callApi('/api/ai', payload);
+    if (result && result.status === 'ok' && typeof (result.answer || result.response) === 'string') {
+      setText('teacher-caption', result.answer || result.response);
+      setText('ai-response', result.answer || result.response);
+      setAiProviderStatus('remote', 'Remote AI · selected step explained');
+      return;
+    }
+    setText('teacher-caption', narrate(event, state.trace[state.step + 1], lineInfoFor(event), source));
+    if (result && result.message) showToast(result.message);
+  }
+
   function loadExample(name) {
     const examples = {
       recursion: 'def countdown(n):\n    if n <= 0:\n        return "go!"\n    return countdown(n - 1)\n\nresult = countdown(3)\nprint(result)',
@@ -943,6 +1244,21 @@
     $('next-step').addEventListener('click', () => moveTimeline(1));
     $('play-button').addEventListener('click', togglePlayback);
     $('sound-toggle').addEventListener('click', toggleSound);
+    $('teacher-play').addEventListener('click', () => {
+      if (!state.speechSupported) { speakCurrent(); return; }
+      if (state.speechPlaying) { cancelSpeech(); return; }
+      speakCurrent();
+    });
+    $('teacher-prev').addEventListener('click', () => moveTimeline(-1));
+    $('teacher-next').addEventListener('click', () => moveTimeline(1));
+    $('teacher-replay').addEventListener('click', () => speakCurrent(true));
+    $('teacher-simple').addEventListener('click', () => setTeacherMode('simple'));
+    $('teacher-detailed').addEventListener('click', () => setTeacherMode('detailed'));
+    $('teacher-explain').addEventListener('click', explainMore);
+    $('teacher-speed').addEventListener('change', (event) => { state.teacherSpeed = Number(event.target.value) || 1; persistTeacherPreference('speed', state.teacherSpeed); cancelSpeech(); });
+    $('teacher-language').addEventListener('change', (event) => { state.teacherLanguage = event.target.value === 'hi' ? 'hi' : 'en'; persistTeacherPreference('language', state.teacherLanguage); cancelSpeech(); renderSelectedEvent(); });
+    $('teacher-voice').addEventListener('change', (event) => { state.teacherVoice = event.target.value; persistTeacherPreference('voice', state.teacherVoice); cancelSpeech(); });
+    $('teacher-auto-advance').addEventListener('change', (event) => { state.teacherAutoAdvance = event.target.checked; persistTeacherPreference('auto', state.teacherAutoAdvance); });
     $('reset-timeline').addEventListener('click', () => { selectTimelineStep(0, true); setText('run-status', 'Waiting for your code'); });
     $('flow-map').addEventListener('click', (event) => {
       const step = event.target.closest('.flow-step');
@@ -979,7 +1295,38 @@
     $('challenge-button').addEventListener('click', () => { loadExample('debug'); document.querySelector('#visualizer').scrollIntoView({ behavior: 'smooth' }); showToast('Challenge loaded — find the output mismatch.'); });
     $('mobile-menu').addEventListener('click', () => { const nav = document.querySelector('.main-nav'); const open = nav.classList.toggle('mobile-open'); $('mobile-menu').setAttribute('aria-expanded', String(open)); });
     all('.nav-link').forEach((link) => link.addEventListener('click', () => document.querySelector('.main-nav').classList.remove('mobile-open')));
+    document.addEventListener('keydown', (event) => {
+      const target = event.target;
+      if (target && (target.matches('input, textarea, select') || target.isContentEditable)) return;
+      if (event.key === ' ' && state.trace.length) { event.preventDefault(); $('teacher-play').click(); }
+      if (event.key === 'ArrowLeft' && state.trace.length) { event.preventDefault(); moveTimeline(-1); }
+      if (event.key === 'ArrowRight' && state.trace.length) { event.preventDefault(); moveTimeline(1); }
+    });
   }
+
+  function persistTeacherPreference(key, value) {
+    try { localStorage.setItem(`codeflow.teacher.${key}`, String(value)); } catch (_) { /* persistence is optional */ }
+  }
+
+  function setTeacherMode(mode) {
+    state.teacherMode = mode === 'detailed' ? 'detailed' : 'simple';
+    persistTeacherPreference('mode', state.teacherMode);
+    ['simple', 'detailed'].forEach((name) => {
+      const button = $(`teacher-${name}`);
+      if (button) { const active = state.teacherMode === name; button.classList.toggle('active', active); button.setAttribute('aria-pressed', String(active)); }
+    });
+    renderSelectedEvent();
+  }
+
+  window.CodeFlowTeacher = Object.freeze({
+    narrate(event, nextEvent, language = 'en') {
+      const before = event && event.before_variables;
+      const after = event && event.after_variables;
+      const lineInfo = event && event.line_info;
+      const source = event && (event.source_line || event.source || '');
+      return narrationForLanguage(event, nextEvent, lineInfo, source, language === 'hi' ? 'hi' : 'en', before, after);
+    }
+  });
 
   function replaceText(allMatches) {
     const editor = $('code-editor');
@@ -1000,7 +1347,7 @@
       state.source = editor ? editor.value : '';
       state.snapshot = state.source;
       state.history = [state.source];
-      updateLineNumbers(); updateCursor(); updateTimeline(); bindEvents(); configureSoundSupport(); refreshHealth();
+      updateLineNumbers(); updateCursor(); updateTimeline(); bindEvents(); configureSoundSupport(); configureTeacherSpeech(); refreshHealth();
     } catch (error) {
       // Keep the page usable even if a browser extension changes the DOM.
       setText('run-status', 'Ready — some optional controls are unavailable');

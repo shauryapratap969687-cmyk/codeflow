@@ -37,6 +37,8 @@ MAX_OUTPUT_BYTES = 16 * 1024
 MAX_EVENTS = 500
 MAX_VARIABLES = 100
 MAX_STACK = 50
+MAX_LINE_INFO_TEXT = 400
+MAX_LINE_INFO_FIELDS = 24
 EXECUTION_TIMEOUT_SECONDS = 2.0
 AI_TIMEOUT_SECONDS = 12.0
 MAX_AI_PROMPT_BYTES = 8 * 1024
@@ -46,6 +48,7 @@ RESULT_FILE_LIMIT = 256 * 1024
 RESULT_TARGET_BYTES = 200 * 1024  # the worker fits its result under this, below RESULT_FILE_LIMIT
 EVENT_BUDGET_BYTES = 150 * 1024
 RESULT_MARKER = "CodeFlow backend"
+JAVASCRIPT_OUTPUT_ONLY_MESSAGE = "JavaScript execution is output-only; Python-style step tracing and line_info are unavailable."
 # The only files the static handlers will ever serve (never source, config or .git).
 STATIC_FILES = frozenset({"index.html", "app.js", "styles.css", "responsive.css"})
 PYTHON_MEMORY_LIMIT_BYTES = 768 * 1024 * 1024
@@ -277,6 +280,213 @@ def _bounded_text(value: str, limit: int = MAX_OUTPUT_BYTES) -> tuple[str, bool]
     return encoded[:limit].decode("utf-8", "replace"), True
 
 
+_LINE_KINDS = {
+    "Assign": "assignment",
+    "AnnAssign": "assignment",
+    "AugAssign": "augassign",
+    "NamedExpr": "assignment",
+    "For": "for",
+    "AsyncFor": "async_for",
+    "While": "while",
+    "If": "if",
+    "Match": "match",
+    "FunctionDef": "function",
+    "AsyncFunctionDef": "async_function",
+    "ClassDef": "class",
+    "Return": "return",
+    "Yield": "yield",
+    "YieldFrom": "yield_from",
+    "Expr": "expression",
+    "Import": "import",
+    "ImportFrom": "import",
+    "Try": "try",
+    "TryStar": "try",
+    "With": "with",
+    "AsyncWith": "async_with",
+    "Raise": "raise",
+    "Assert": "assert",
+    "Pass": "pass",
+    "Break": "break",
+    "Continue": "continue",
+    "Global": "global",
+    "Nonlocal": "nonlocal",
+    "Delete": "delete",
+}
+
+
+def _short_ast_text(value: str, limit: int = MAX_LINE_INFO_TEXT) -> str:
+    value = str(value)
+    return value if len(value) <= limit else value[:limit - 1] + "…"
+
+
+class _LineFacts(ast.NodeVisitor):
+    """Collect names from syntax only; this visitor never evaluates an AST."""
+
+    def __init__(self) -> None:
+        self.reads: list[str] = []
+        self.writes: list[str] = []
+        self.calls: list[str] = []
+
+    @staticmethod
+    def _add(target: list[str], value: str) -> None:
+        if value and value not in target and len(target) < MAX_LINE_INFO_FIELDS:
+            target.append(_short_ast_text(value, 120))
+
+    def visit_Name(self, node: ast.Name) -> None:
+        self._add(self.writes if isinstance(node.ctx, (ast.Store, ast.Del)) else self.reads, node.id)
+
+    def visit_Call(self, node: ast.Call) -> None:
+        function = node.func
+        if isinstance(function, ast.Name):
+            self._add(self.calls, function.id)
+        elif isinstance(function, ast.Attribute):
+            parts: list[str] = []
+            item: ast.AST | None = function
+            while isinstance(item, ast.Attribute):
+                parts.append(item.attr)
+                item = item.value
+            if isinstance(item, ast.Name):
+                parts.append(item.id)
+            self._add(self.calls, ".".join(reversed(parts)))
+        self.generic_visit(node)
+
+    def visit_AugAssign(self, node: ast.AugAssign) -> None:
+        # Augmented assignment reads its target before writing it.
+        self.visit(node.target)
+        if isinstance(node.target, ast.Name):
+            self._add(self.reads, node.target.id)
+        self.visit(node.value)
+
+    def visit_For(self, node: ast.For) -> None:
+        self.visit(node.target)
+        self.visit(node.iter)
+
+    visit_AsyncFor = visit_For
+
+    def visit_While(self, node: ast.While) -> None:
+        self.visit(node.test)
+
+    def visit_If(self, node: ast.If) -> None:
+        self.visit(node.test)
+
+    def visit_With(self, node: ast.With) -> None:
+        for item in node.items:
+            self.visit(item.context_expr)
+            if item.optional_vars is not None:
+                self.visit(item.optional_vars)
+
+    visit_AsyncWith = visit_With
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        self._add(self.writes, node.name)
+        for decorator in node.decorator_list:
+            self.visit(decorator)
+        for base in node.bases:
+            self.visit(base)
+        for keyword in node.keywords:
+            self.visit(keyword.value)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self._add(self.writes, node.name)
+        for decorator in node.decorator_list:
+            self.visit(decorator)
+        for default in [*node.args.defaults, *node.args.kw_defaults]:
+            if default is not None:
+                self.visit(default)
+        if node.returns is not None:
+            self.visit(node.returns)
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        # The lambda body executes later, so it is not a read/write of this line.
+        for default in [*node.args.defaults, *node.args.kw_defaults]:
+            if default is not None:
+                self.visit(default)
+
+
+def _node_span(node: ast.AST) -> tuple[int, int]:
+    start = getattr(node, "lineno", 0) or 0
+    end = getattr(node, "end_lineno", None) or start
+    return start, max(start, end)
+
+
+def _safe_ast_expression(node: ast.AST) -> str:
+    try:
+        # ast.unparse formats syntax; it does not compile or execute the expression.
+        return _short_ast_text(ast.unparse(node))
+    except Exception:  # noqa: BLE001 - malformed/very deep syntax still gets line metadata
+        return ""
+
+
+def _analyze_python_source(source: str) -> dict[int, dict[str, Any]]:
+    """Return bounded, syntax-derived information for every source line.
+
+    This intentionally accepts only AST structure and never calls ``eval`` or
+    executes user code. Invalid input still gets one safe placeholder per line.
+    """
+    source_lines = source.splitlines()
+    result: dict[int, dict[str, Any]] = {
+        index: {
+            "line": index,
+            "text": _short_ast_text(text),
+            "kind": "blank" if not text.strip() else ("comment" if text.lstrip().startswith("#") else "unknown"),
+            "reads": [],
+            "writes": [],
+            "calls": [],
+            "expression": "",
+        }
+        for index, text in enumerate(source_lines, 1)
+    }
+    if not source_lines:
+        return result
+    try:
+        tree = ast.parse(source, filename="codeflow_user.py", mode="exec")
+    except (SyntaxError, ValueError, TypeError, RecursionError, MemoryError):
+        return result
+    statements = [node for node in ast.walk(tree) if isinstance(node, ast.stmt) and hasattr(node, "lineno")]
+    for line, item in result.items():
+        candidates = [node for node in statements if _node_span(node)[0] <= line <= _node_span(node)[1]]
+        if not candidates:
+            continue
+        node = min(candidates, key=lambda candidate: (_node_span(candidate)[1] - _node_span(candidate)[0], _node_span(candidate)[0]))
+        facts = _LineFacts()
+        try:
+            facts.visit(node)
+        except Exception:  # noqa: BLE001 - metadata must never affect execution
+            facts = _LineFacts()
+        item.update({
+            "kind": _LINE_KINDS.get(type(node).__name__, type(node).__name__.lower()),
+            "reads": facts.reads,
+            "writes": facts.writes,
+            "calls": facts.calls,
+            "expression": _safe_ast_expression(node),
+        })
+    return result
+
+
+def _fit_python_response(result: dict[str, Any]) -> dict[str, Any]:
+    """Keep newly-added Teacher metadata inside the existing response budget."""
+    def size() -> int:
+        return len(json.dumps(result, ensure_ascii=False, default=str).encode("utf-8", "replace"))
+
+    while size() > RESULT_TARGET_BYTES and result.get("events"):
+        count = len(result["events"])
+        result["events"] = result["events"][: (count // 2 if count > 1 else 0)]
+        result["trace"] = result["events"]
+        result.setdefault("limits", {})["events_truncated"] = True
+    while size() > RESULT_TARGET_BYTES and result.get("line_info"):
+        info = result["line_info"]
+        if not isinstance(info, dict):
+            break
+        keys = list(info)
+        result["line_info"] = {key: info[key] for key in keys[: (len(keys) // 2 if len(keys) > 1 else 0)]}
+        result.setdefault("limits", {})["line_info_truncated"] = True
+    if size() > RESULT_TARGET_BYTES:
+        result["variables"] = {}
+    return result
+
+
 def _json_safe(value: Any, depth: int = 0) -> Any:
     """Replace NaN/Infinity (not valid JSON) so every response can be serialised."""
     if isinstance(value, float):
@@ -345,7 +555,7 @@ def _ai_daily_budget_available() -> bool:
 
 def _limited_run_result(language: str, status: str, title: str, detail: str, kind: str) -> dict[str, Any]:
     """A normal-shaped (HTTP 200) result so the UI shows the reason instead of 'offline mode'."""
-    return {
+    result = {
         "status": status,
         "language": language,
         "output": [],
@@ -354,8 +564,16 @@ def _limited_run_result(language: str, status: str, title: str, detail: str, kin
         "variables": {},
         "events": [],
         "call_stack": [],
+        "line_info": [],
         "diagnostics": [_diagnostic(title, detail, kind=kind)],
     }
+    if language == "javascript":
+        result.update({
+            "teacher_mode": "output-only",
+            "trace_supported": False,
+            "trace_message": JAVASCRIPT_OUTPUT_ONLY_MESSAGE,
+        })
+    return result
 
 
 def _harden_server_process() -> None:
@@ -375,6 +593,7 @@ _harden_server_process()
 
 
 PYTHON_RUNNER = r'''
+import ast
 import builtins
 import itertools
 import json
@@ -467,6 +686,13 @@ class LimitedText:
 
 
 def safe_value(value, depth=0):
+    try:
+        return _safe_value(value, depth)
+    except BaseException:
+        return "<unrepresentable>"
+
+
+def _safe_value(value, depth=0):
     if depth > 3:
         return "<nested>"
     if isinstance(value, float) and (value != value or value in (float("inf"), float("-inf"))):
@@ -496,11 +722,63 @@ def snapshot(values):
     return result
 
 
+def loop_ranges(source):
+    """Find loop spans from syntax; iteration numbers come only from trace visits."""
+    try:
+        tree = ast.parse(source, filename=SOURCE_NAME, mode="exec")
+    except Exception:
+        return []
+    found = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.For, ast.AsyncFor, ast.While)) and getattr(node, "lineno", None):
+            body_lines = [getattr(item, "lineno", node.lineno) for item in getattr(node, "body", [])]
+            end = getattr(node, "end_lineno", None) or max(body_lines or [node.lineno])
+            found.append({"line": node.lineno, "body_start": min(body_lines or [node.lineno]), "end": end})
+    return found
+
+
 events = []
 stack = []
 events_truncated = False
 event_bytes = 0
 tracing_stopped = False
+last_stdout_size = 0
+loop_definitions = []
+loop_counts = {}
+open_events = {}
+
+
+def loop_metadata(frame, line):
+    candidates = [item for item in loop_definitions if item["line"] == line or item["body_start"] <= line <= item["end"]]
+    if not candidates:
+        return None
+    # Count entry into the first body line, rather than header visits: a final
+    # false while condition or exhausted for iterator is not an iteration.
+    frame_id = id(frame)
+    for item in candidates:
+        if line == item["body_start"]:
+            key = (frame_id, item["line"])
+            loop_counts[key] = loop_counts.get(key, 0) + 1
+    candidates.sort(key=lambda value: value["end"] - value["body_start"])
+    item = next((value for value in candidates if loop_counts.get((frame_id, value["line"]))), None)
+    if item is None:
+        return None
+    return {"loop_line": item["line"], "loop_iteration": loop_counts[(frame_id, item["line"])]}
+
+
+def output_delta():
+    global last_stdout_size
+    current = stdout_capture.getvalue()
+    delta = current[last_stdout_size:]
+    last_stdout_size = len(current)
+    return delta
+
+
+def finalize_previous_event(frame):
+    """Close the previous event in this frame with the next recorded snapshot."""
+    previous = open_events.get(id(frame))
+    if previous is not None and previous.get("after_variables") is None:
+        previous["after_variables"] = snapshot(frame.f_locals)
 
 
 def trace(frame, event, arg):
@@ -516,22 +794,34 @@ def trace(frame, event, arg):
     else:
         event_name = event
     if event in ("call", "line", "return", "exception"):
+        finalize_previous_event(frame)
         recorded = False
         if len(events) < MAX_EVENTS:
+            before_variables = snapshot(frame.f_locals)
             item = {
                 "sequence": len(events),
                 "type": event,
                 "line": frame.f_lineno,
                 "function": function,
-                "variables": snapshot(frame.f_locals),
+                "variables": before_variables,
+                "before_variables": before_variables,
+                "after_variables": None,
                 "call_stack": list(stack[-MAX_STACK:]),
+                "output_delta": output_delta(),
             }
+            if event == "return":
+                item["return_value"] = safe_value(arg)
+                item["after_variables"] = before_variables
+            loop = loop_metadata(frame, frame.f_lineno)
+            if loop is not None:
+                item.update(loop)
             if event == "exception" and isinstance(arg, tuple) and len(arg) > 1:
                 item["exception"] = str(arg[1])[:MAX_VALUE]
             size = len(json.dumps(item, ensure_ascii=False, default=str))
             if event_bytes + size <= EVENT_BUDGET:
                 event_bytes += size
                 events.append(item)
+                open_events[id(frame)] = item
                 recorded = True
         if not recorded:
             # Event count or size budget reached: stop tracing so the program still
@@ -540,8 +830,13 @@ def trace(frame, event, arg):
             tracing_stopped = True
             sys.settrace(None)
             return None
-    if event == "return" and stack:
-        stack.pop()
+    if event == "return":
+        frame_id = id(frame)
+        for key in [key for key in loop_counts if key[0] == frame_id]:
+            loop_counts.pop(key, None)
+        if stack:
+            stack.pop()
+        open_events.pop(frame_id, None)
     return trace
 
 
@@ -582,6 +877,7 @@ metadata = {
 try:
     with open(SOURCE_PATH, "r", encoding="utf-8") as source_file:
         source = source_file.read()
+    loop_definitions = loop_ranges(source)
     try:
         compiled = compile(source, SOURCE_NAME, "exec")
     except SyntaxError as exc:
@@ -729,6 +1025,10 @@ def execute_python(source: str) -> dict[str, Any]:
             ),
         )
         result = _python_result_from_child(child, result_path)
+        result["line_info"] = _analyze_python_source(source)
+        result.setdefault("teacher_mode", "python-trace")
+        result.setdefault("limits", {})["line_info_truncated"] = False
+        result = _fit_python_response(result)
         result["duration_ms"] = round((time.monotonic() - child["started"]) * 1000, 2)
         return result
 
@@ -947,6 +1247,9 @@ def execute_javascript(source: str) -> dict[str, Any]:
             "status": "unsupported",
             "supported": False,
             "language": "javascript",
+            "teacher_mode": "output-only",
+            "trace_supported": False,
+            "trace_message": JAVASCRIPT_OUTPUT_ONLY_MESSAGE,
             "output": [],
             "stdout": "",
             "stderr": "",
@@ -990,6 +1293,9 @@ def execute_javascript(source: str) -> dict[str, Any]:
             return {
                 "status": "timeout",
                 "language": "javascript",
+                "teacher_mode": "output-only",
+                "trace_supported": False,
+                "trace_message": JAVASCRIPT_OUTPUT_ONLY_MESSAGE,
                 "output": _split_output(stdout),
                 "stdout": stdout,
                 "stderr": stderr,
@@ -1008,6 +1314,9 @@ def execute_javascript(source: str) -> dict[str, Any]:
             return {
                 "status": "error",
                 "language": "javascript",
+                "teacher_mode": "output-only",
+                "trace_supported": False,
+                "trace_message": JAVASCRIPT_OUTPUT_ONLY_MESSAGE,
                 "output": _split_output(stdout),
                 "stdout": stdout,
                 "stderr": stderr,
@@ -1020,6 +1329,9 @@ def execute_javascript(source: str) -> dict[str, Any]:
             "status": metadata.get("status", "error"),
             "supported": True,
             "language": "javascript",
+            "teacher_mode": "output-only",
+            "trace_supported": False,
+            "trace_message": JAVASCRIPT_OUTPUT_ONLY_MESSAGE,
             "output": metadata.get("output", []),
             "stdout": stdout,
             "stderr": metadata.get("stderr", "") or stderr,
