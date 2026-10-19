@@ -28,7 +28,8 @@ const checks = [
   ['speech preferences', js.includes('voiceschanged') && js.includes('codeflow.teacher.speed')],
   ['call tree view', html.includes('id="call-tree-view-tab"') && html.includes('id="call-tree-panel"') && js.includes('buildCallTree')],
   ['call tree accessibility', js.includes('role="button"') && js.includes('call-tree-node') && js.includes('prepareCallTree')],
-  ['debug panel', html.includes('id="expected-output"') && html.includes('id="debug-compare"') && js.includes('compareDebugOutput')]
+  ['debug panel', html.includes('id="expected-output"') && html.includes('id="debug-compare"') && js.includes('compareDebugOutput')],
+  ['quiz controls', html.includes('id="quiz-toggle"') && html.includes('id="quiz-panel"') && js.includes('quizQuestionForStep')]
 ];
 if (/coldchain|cold-chain/i.test(html + js + backend)) throw new Error('Standalone folder contains an unrelated product reference');
 const failed = checks.filter(([, passed]) => !passed);

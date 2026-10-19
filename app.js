@@ -33,7 +33,13 @@
     speechVoices: [],
     speechSupported: false,
     speechPlaying: false,
-    speechToken: 0
+    speechToken: 0,
+    quizEnabled: false,
+    quizPending: null,
+    quizAsked: 0,
+    quizCorrect: 0,
+    quizStreak: 0,
+    quizBestStreak: 0
   };
 
   const $ = (id) => document.getElementById(id);
@@ -334,6 +340,80 @@
     const context = selectedLine ? `<div class="debug-context">Mapped to recorded step ${Number(evidence.selectedIndex) + 1} on line ${Number(selectedLine)}.</div>` : '<div class="debug-context">No exact trace step could be mapped to this output line.</div>';
     const truncation = evidence.truncated ? '<div class="debug-context">Some output or trace data was truncated; only recorded evidence is shown.</div>' : '';
     container.innerHTML = `${mismatch}${context}${truncation}<div class="debug-read-heading">Values read by that line</div>${variableRows}`;
+  }
+
+  function updateQuizScore() {
+    setText('quiz-score', `Quiz ${state.quizCorrect}/${state.quizAsked}${state.quizStreak ? ` · streak ${state.quizStreak}` : ''}`);
+  }
+
+  function speakQuizText(text) {
+    if (!state.speechSupported || !text || !window.speechSynthesis) return;
+    window.speechSynthesis.cancel();
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.lang = state.teacherLanguage === 'hi' ? 'hi-IN' : 'en-US';
+    utterance.rate = state.teacherSpeed;
+    const voice = state.speechVoices.find((item) => item.name === state.teacherVoice);
+    if (voice) utterance.voice = voice;
+    window.speechSynthesis.speak(utterance);
+  }
+
+  function hideQuizPrompt() {
+    state.quizPending = null;
+    const panel = $('quiz-panel');
+    if (panel) panel.classList.add('hidden');
+  }
+
+  function showQuizPrompt(question) {
+    if (!question) return false;
+    state.quizPending = question;
+    state.quizAsked += 1;
+    updateQuizScore();
+    const panel = $('quiz-panel');
+    if (panel) panel.classList.remove('hidden');
+    setText('quiz-question', question.question);
+    setText('quiz-hint', question.hint || 'Hint: recorded read values are shown after you answer.');
+    setText('quiz-feedback', 'Waiting for your answer');
+    const answer = $('quiz-answer');
+    if (answer) { answer.value = ''; answer.focus(); }
+    speakQuizText(question.question);
+    return true;
+  }
+
+  function finishQuiz(reveal = false) {
+    const pending = state.quizPending;
+    if (!pending) return;
+    const answerInput = $('quiz-answer');
+    const answer = answerInput ? answerInput.value : '';
+    const correct = !reveal && quizAnswersMatch(answer, pending.expected);
+    if (!reveal && !correct) {
+      state.quizStreak = 0;
+      setText('quiz-feedback', 'Not yet — try again or use Show me.');
+      speakQuizText('Not yet. Try again or use Show me.');
+      updateQuizScore();
+      return;
+    }
+    if (correct) {
+      state.quizCorrect += 1;
+      state.quizStreak += 1;
+      state.quizBestStreak = Math.max(state.quizBestStreak, state.quizStreak);
+      setText('quiz-feedback', 'Correct — revealing the recorded result.');
+      speakQuizText('Correct. Revealing the recorded result.');
+    } else {
+      state.quizStreak = 0;
+      setText('quiz-feedback', `Recorded answer: ${valueText(pending.expected)}.`);
+      speakQuizText(`The recorded answer is ${valueText(pending.expected)}.`);
+    }
+    updateQuizScore();
+    const targetStep = pending.targetStep;
+    state.quizPending = null;
+    selectTimelineStep(targetStep, true, 'quiz');
+  }
+
+  function setQuizEnabled(enabled) {
+    state.quizEnabled = Boolean(enabled);
+    try { localStorage.setItem('codeflow.teacher.quiz', String(state.quizEnabled)); } catch (_) { /* persistence is optional */ }
+    if (!state.quizEnabled) hideQuizPrompt();
+    updateQuizScore();
   }
 
   function compareExpectedOutput() {
@@ -943,6 +1023,79 @@
     return phrase;
   }
 
+  function quizAnswerValue(value) {
+    if (value === null || typeof value === 'boolean') return true;
+    if (typeof value === 'number') return Number.isFinite(value) && Math.abs(value) <= 1e12;
+    if (typeof value === 'string') return value.length <= 80;
+    if (Array.isArray(value)) return value.length <= 8 && value.every((item) => item === null || typeof item === 'string' || typeof item === 'number' || typeof item === 'boolean');
+    return false;
+  }
+
+  function normalizeQuizAnswer(value) {
+    const text = String(value ?? '').trim();
+    if (!text) return '';
+    const unquoted = ((text.startsWith('"') && text.endsWith('"')) || (text.startsWith("'") && text.endsWith("'"))) ? text.slice(1, -1) : text;
+    if (/^-?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?$/i.test(unquoted)) return String(Number(unquoted));
+    return unquoted.replace(/\s+/g, ' ');
+  }
+
+  function quizAnswersMatch(answer, expected) {
+    return normalizeQuizAnswer(answer) === normalizeQuizAnswer(typeof expected === 'string' ? expected : valueText(expected));
+  }
+
+  function sourceBlockEnd(source, lineNumber) {
+    const lines = String(source || '').split('\n');
+    const line = lines[lineNumber - 1] || '';
+    const indent = (line.match(/^\s*/) || [''])[0].length;
+    let end = lineNumber;
+    for (let index = lineNumber; index < lines.length; index += 1) {
+      const value = lines[index];
+      if (!value.trim()) continue;
+      const currentIndent = (value.match(/^\s*/) || [''])[0].length;
+      if (index > lineNumber && currentIndent <= indent) break;
+      end = index + 1;
+    }
+    return end;
+  }
+
+  function conditionAnswerFor(event, nextEvent, source) {
+    const line = eventLine(event);
+    const nextLine = eventLine(nextEvent);
+    const info = lineInfoFor(event) || event && event.line_info || {};
+    if (!line || !nextLine || !['if', 'while'].includes(String(info.kind || '').toLowerCase())) return null;
+    const lines = String(source || '').split('\n');
+    const sourceText = lines[line - 1] || '';
+    const indent = (sourceText.match(/^\s*/) || [''])[0].length;
+    const bodyLine = lines.slice(line).findIndex((value) => value.trim() && (value.match(/^\s*/) || [''])[0].length > indent);
+    if (bodyLine < 0) return null;
+    const bodyStart = line + bodyLine;
+    const blockEnd = sourceBlockEnd(source, line);
+    const nextText = lines[nextLine - 1] || '';
+    if (String(info.kind).toLowerCase() === 'if') {
+      if (/^\s*else\s*:/.test(nextText) || /^\s*elif\s+/.test(nextText)) return { expected: false, reason: 'the next recorded branch was not the body of this condition' };
+      return { expected: nextLine >= bodyStart && nextLine <= blockEnd, reason: 'the next recorded branch in the trace' };
+    }
+    return { expected: nextLine >= bodyStart && nextLine <= blockEnd, reason: 'the next recorded loop step in the trace' };
+  }
+
+  function quizQuestionForStep(events, index, source) {
+    const event = Array.isArray(events) ? events[index] : null;
+    if (!event || String(event.type || event.event || '').toLowerCase() !== 'line') return null;
+    const nextEvent = Array.isArray(events) ? events[index + 1] : null;
+    const info = lineInfoFor(event) || event.line_info || {};
+    const condition = conditionAnswerFor(event, nextEvent, source);
+    if (condition) return { kind: 'condition', targetStep: index, question: 'Will this condition be True or False?', expected: condition.expected, hint: `Hint: ${condition.reason}.`, event, nextEvent };
+    const before = event.before_variables || event.variables || {};
+    const after = event.after_variables || (nextEvent && sameTraceScope(event, nextEvent) ? (nextEvent.before_variables || nextEvent.variables || {}) : null);
+    if (!after || typeof after !== 'object') return null;
+    const names = Array.isArray(info.writes) ? info.writes.map(String) : Object.keys(after);
+    const target = names.find((name) => own(after, name) && (!own(before, name) || !deepEqual(before[name], after[name])) && quizAnswerValue(after[name])) || Object.keys(after).find((name) => (!own(before, name) || !deepEqual(before[name], after[name])) && quizAnswerValue(after[name]));
+    if (!target) return null;
+    const reads = Array.isArray(info.reads) ? info.reads : [];
+    const hintValues = reads.map((name) => `${name}=${own(before, name) ? valueText(before[name]) : 'Unknown'}`).join(', ');
+    return { kind: 'value', target, targetStep: index, question: `After this line, what will ${target} be?`, expected: after[target], hint: hintValues ? `Hint: recorded read values were ${hintValues}.` : 'Hint: no recorded read values are available.', event, nextEvent };
+  }
+
   function targetFor(event, source) {
     if (event && typeof event === 'object') {
       const target = event.target || event.variable || event.name;
@@ -1222,6 +1375,7 @@
       state.teacherSpeed = Number(localStorage.getItem('codeflow.teacher.speed')) || 1;
       state.teacherVoice = localStorage.getItem('codeflow.teacher.voice') || '';
       state.teacherAutoAdvance = localStorage.getItem('codeflow.teacher.auto') === 'true';
+      state.quizEnabled = localStorage.getItem('codeflow.teacher.quiz') === 'true';
     } catch (_) { /* preferences are optional */ }
     state.teacherMode = state.teacherMode === 'detailed' ? 'detailed' : 'simple';
     state.teacherLanguage = state.teacherLanguage === 'hi' ? 'hi' : 'en';
@@ -1229,6 +1383,7 @@
     if ($('teacher-language')) $('teacher-language').value = state.teacherLanguage;
     if ($('teacher-speed')) $('teacher-speed').value = String(state.teacherSpeed);
     if ($('teacher-auto-advance')) $('teacher-auto-advance').checked = state.teacherAutoAdvance;
+    if ($('quiz-toggle')) $('quiz-toggle').checked = state.quizEnabled;
     if ($('teacher-simple')) $('teacher-simple').classList.toggle('active', state.teacherMode !== 'detailed');
     if ($('teacher-detailed')) $('teacher-detailed').classList.toggle('active', state.teacherMode === 'detailed');
     if (window.speechSynthesis) {
@@ -1423,6 +1578,11 @@
   async function runCode() {
     const source = $('code-editor').value;
     state.debugEvidence = null;
+    hideQuizPrompt();
+    state.quizAsked = 0;
+    state.quizCorrect = 0;
+    state.quizStreak = 0;
+    updateQuizScore();
     renderDebugEvidence(null);
     setText('run-status', 'Running…');
     setText('run-time', 'now');
@@ -1547,6 +1707,14 @@
     const length = all('.flow-step').length;
     if (!length) return;
     const nextStep = Math.max(0, Math.min(length - 1, step));
+    if (state.quizEnabled && source === 'playback' && nextStep !== state.step) {
+      const question = quizQuestionForStep(state.trace, nextStep, state.executedSource);
+      if (question) {
+        stopPlayback('Quiz paused — answer before revealing the next result');
+        showQuizPrompt(question);
+        return;
+      }
+    }
     const changed = nextStep !== state.step;
     state.step = nextStep;
     updateTimeline();
@@ -1720,6 +1888,10 @@
     $('teacher-language').addEventListener('change', (event) => { state.teacherLanguage = event.target.value === 'hi' ? 'hi' : 'en'; persistTeacherPreference('language', state.teacherLanguage); cancelSpeech(); renderSelectedEvent(); });
     $('teacher-voice').addEventListener('change', (event) => { state.teacherVoice = event.target.value; persistTeacherPreference('voice', state.teacherVoice); cancelSpeech(); });
     $('teacher-auto-advance').addEventListener('change', (event) => { state.teacherAutoAdvance = event.target.checked; persistTeacherPreference('auto', state.teacherAutoAdvance); });
+    $('quiz-toggle').addEventListener('change', (event) => setQuizEnabled(event.target.checked));
+    $('quiz-submit').addEventListener('click', () => finishQuiz(false));
+    $('quiz-show').addEventListener('click', () => finishQuiz(true));
+    $('quiz-answer').addEventListener('keydown', (event) => { if (event.key === 'Enter') { event.preventDefault(); finishQuiz(false); } });
     $('reset-timeline').addEventListener('click', () => { selectTimelineStep(0, true); setText('run-status', 'Waiting for your code'); });
     $('flow-map').addEventListener('click', (event) => {
       const step = event.target.closest('.flow-step');
@@ -1829,6 +2001,12 @@
     compareDebugOutput,
     outputEventMap,
     debugSummary
+  });
+  window.CodeFlowQuiz = Object.freeze({
+    normalizeQuizAnswer,
+    quizAnswersMatch,
+    quizAnswerValue,
+    quizQuestionForStep
   });
 
   function replaceText(allMatches) {
