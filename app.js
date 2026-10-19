@@ -40,6 +40,8 @@
     quizCorrect: 0,
     quizStreak: 0,
     quizBestStreak: 0
+    ,lineHeat: {}
+    ,lineHeatTruncated: false
   };
 
   const $ = (id) => document.getElementById(id);
@@ -252,7 +254,125 @@
     const numbers = $('line-numbers');
     if (!editor || !numbers) return;
     const count = Math.max(1, editor.value.split('\n').length);
-    numbers.innerHTML = Array.from({ length: count }, (_, index) => `<span class="${index + 1 === state.activeLine ? 'active' : ''}">${String(index + 1).padStart(2, '0')}</span>`).join('\n');
+    const maxRuns = Math.max(1, ...Object.values(state.lineHeat || {}));
+    numbers.innerHTML = Array.from({ length: count }, (_, index) => {
+      const line = index + 1;
+      const runs = Number(state.lineHeat && state.lineHeat[line]) || 0;
+      const heat = runs ? ` style="--heat:${Math.min(1, runs / maxRuns)}" title="Line ${line} recorded ${runs} time${runs === 1 ? '' : 's'}"` : '';
+      return `<span class="${line === state.activeLine ? 'active ' : ''}${runs ? 'has-heat' : ''}" data-runs="${runs}"${heat}>${String(line).padStart(2, '0')}</span>`;
+    }).join('\n');
+  }
+
+  function lineHeatFromEvents(events) {
+    const counts = {};
+    (Array.isArray(events) ? events : []).forEach((event) => {
+      const line = eventLine(event);
+      if (Number.isInteger(line) && line > 0) counts[line] = (counts[line] || 0) + 1;
+    });
+    return counts;
+  }
+
+  function lineHeatSummary(counts, truncated = false) {
+    const entries = Object.entries(counts || {}).map(([line, count]) => [Number(line), Number(count)]).filter(([, count]) => count > 0);
+    if (!entries.length) return 'Run the program to see recorded line heat.';
+    entries.sort((a, b) => b[1] - a[1] || a[0] - b[0]);
+    const [line, count] = entries[0];
+    return `Line ${line} ran ${count} time${count === 1 ? '' : 's'} — it is the busiest recorded line${truncated ? ' (counts cover recorded steps only because the trace was truncated)' : ''}. More repetitions mean more work, but this is not a complexity claim.`;
+  }
+
+  function renderLineHeat(result) {
+    state.lineHeat = lineHeatFromEvents(result && result.events);
+    state.lineHeatTruncated = Boolean(result && result.limits && result.limits.events_truncated);
+    updateLineNumbers();
+    setText('line-heat-summary', lineHeatSummary(state.lineHeat, state.lineHeatTruncated));
+  }
+
+  const SHARE_MAX_SOURCE_BYTES = 64 * 1024;
+
+  function bytesToBase64Url(bytes) {
+    let binary = '';
+    for (let index = 0; index < bytes.length; index += 0x8000) binary += String.fromCharCode(...bytes.slice(index, index + 0x8000));
+    return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+  }
+
+  function base64UrlToBytes(value) {
+    const normalized = String(value || '').replace(/-/g, '+').replace(/_/g, '/') + '='.repeat((4 - String(value || '').length % 4) % 4);
+    const binary = atob(normalized);
+    return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+  }
+
+  function plainSharePayload(language, code) {
+    const text = String(code || '');
+    if (new TextEncoder().encode(text).byteLength > SHARE_MAX_SOURCE_BYTES) return null;
+    const payload = JSON.stringify({ language: language === 'javascript' ? 'javascript' : 'python', code: text });
+    return `p.${bytesToBase64Url(new TextEncoder().encode(payload))}`;
+  }
+
+  function decodePlainSharePayload(payload) {
+    const value = JSON.parse(new TextDecoder().decode(base64UrlToBytes(String(payload || ''))));
+    if (!value || typeof value.code !== 'string' || new TextEncoder().encode(value.code).byteLength > SHARE_MAX_SOURCE_BYTES) return null;
+    return { language: value.language === 'javascript' ? 'javascript' : 'python', code: value.code };
+  }
+
+  async function compressedSharePayload(language, code) {
+    if (typeof CompressionStream !== 'function' || typeof Blob !== 'function' || typeof Response !== 'function') return null;
+    const plain = plainSharePayload(language, code);
+    if (!plain) return null;
+    try {
+      const bytes = new TextEncoder().encode(plain.slice(2));
+      const stream = new Blob([bytes]).stream().pipeThrough(new CompressionStream('gzip'));
+      const compressed = new Uint8Array(await new Response(stream).arrayBuffer());
+      return `g.${bytesToBase64Url(compressed)}`;
+    } catch (_) { return null; }
+  }
+
+  async function decodeCompressedSharePayload(payload) {
+    if (typeof DecompressionStream !== 'function' || typeof Response !== 'function') return null;
+    try {
+      const stream = new Blob([base64UrlToBytes(String(payload || ''))]).stream().pipeThrough(new DecompressionStream('gzip'));
+      const plain = new TextDecoder().decode(await new Response(stream).arrayBuffer());
+      return decodePlainSharePayload(plain);
+    } catch (_) { return null; }
+  }
+
+  async function shareHashFor(language, code) {
+    const compressed = await compressedSharePayload(language, code);
+    return `#codeflow=1.${compressed || plainSharePayload(language, code) || ''}`;
+  }
+
+  async function decodeShareHash(hash) {
+    const prefix = '#codeflow=1.';
+    if (typeof hash !== 'string' || !hash.startsWith(prefix)) return null;
+    const payload = hash.slice(prefix.length);
+    if (payload.startsWith('p.')) {
+      try { return decodePlainSharePayload(payload.slice(2)); } catch (_) { return null; }
+    }
+    if (payload.startsWith('g.')) return decodeCompressedSharePayload(payload.slice(2));
+    return null;
+  }
+
+  async function copyShareLink() {
+    const hash = await shareHashFor(state.language, $('code-editor') ? $('code-editor').value : '');
+    if (!hash.endsWith('.')) {
+      try {
+        await navigator.clipboard.writeText(`${location.href.split('#')[0]}${hash}`);
+        showToast('Share link copied. It contains your code; anyone with the link can read it.');
+      } catch (_) { showToast('Could not copy the share link in this browser.'); }
+    } else showToast('This code is too large to share safely.');
+  }
+
+  async function loadSharedHash() {
+    if (typeof location === 'undefined' || !location.hash) return;
+    const shared = await decodeShareHash(location.hash);
+    if (!shared) { if (location.hash.startsWith('#codeflow=')) showToast('The share link is invalid or too large.'); return; }
+    const editor = $('code-editor');
+    if (!editor) return;
+    editor.value = shared.code;
+    state.language = shared.language;
+    if ($('language-select')) $('language-select').value = shared.language;
+    if ($('file-name')) $('file-name').textContent = shared.language === 'javascript' ? 'main.js' : 'main.py';
+    updateLineNumbers(); updateCursor();
+    showToast('Shared code loaded. Review it, then press Run; it was not auto-run.');
   }
 
   function updateCursor() {
@@ -1593,6 +1713,7 @@
       renderConsole(output, false);
       renderVariables(result.variables || {});
       renderTrace(result, source);
+      renderLineHeat(result);
       const diagnostics = result.diagnostics || result.errors || [];
       const passed = result.status === 'completed' && diagnostics.length === 0;
       renderDiagnostics(diagnostics, passed);
@@ -1608,10 +1729,12 @@
       renderVariables(fallback.variables);
       renderDiagnostics(fallback.diagnostics, fallback.diagnostics.length === 0);
       renderTrace(fallback, source);
+      renderLineHeat(fallback);
       setText('run-status', fallback.status === 'unsupported' ? 'Not executed · offline subset boundary' : 'Complete · offline fallback');
     } else {
       renderConsole(['API unavailable. Switch to Python for the offline fallback.'], true);
       renderTrace({ status: 'error', events: [], variables: {}, call_stack: [] }, source);
+      renderLineHeat({ events: [] });
       renderVariables({});
       renderDiagnostics([{ title: 'Execution service unavailable', detail: 'The JavaScript offline fallback is not enabled.' }], false);
       setText('run-status', 'Could not run');
@@ -1856,7 +1979,13 @@
     const examples = {
       recursion: 'def countdown(n):\n    if n <= 0:\n        return "go!"\n    return countdown(n - 1)\n\nresult = countdown(3)\nprint(result)',
       loops: 'total = 0\nfor number in [1, 2, 3, 4]:\n    total = total + number\nprint(total)',
-      debug: 'name = "Ada"\ngreeting = "Hello, " + name\nprint(greeting)'
+      debug: 'name = "Ada"\ngreeting = "Hello, " + name\nprint(greeting)',
+      'buggy-sum': 'numbers = [2, 4, 6]\ntotal = 0\nfor number in numbers:\n    total = total + number + 1\nprint(total)',
+      fibonacci: 'def fib(n):\n    if n <= 1:\n        return n\n    return fib(n - 1) + fib(n - 2)\n\nprint(fib(5))',
+      'bubble-sort': 'values = [4, 1, 3, 2]\nfor end in range(len(values) - 1, 0, -1):\n    for index in range(end):\n        if values[index] > values[index + 1]:\n            values[index], values[index + 1] = values[index + 1], values[index]\nprint(values)',
+      'string-reversal': 'text = "codeflow"\nreversed_text = text[::-1]\nprint(reversed_text)',
+      'list-dict': 'items = ["pen", "book"]\nprices = {"pen": 2, "book": 5}\ntotal = prices[items[0]] + prices[items[1]]\nprint(total)',
+      'runtime-error': 'items = [1, 2, 3]\nprint(items[5])'
     };
     const editor = $('code-editor');
     if (editor && examples[name]) { editor.value = examples[name]; state.language = 'python'; $('language-select').value = 'python'; updateLineNumbers(); updateCursor(); saveSnapshot(); showToast(`${name[0].toUpperCase()}${name.slice(1)} example loaded.`); }
@@ -1940,6 +2069,7 @@
     $('replace-all-button').addEventListener('click', () => replaceText(true));
     $('theme-toggle').addEventListener('click', () => { document.body.classList.toggle('light'); showToast(document.body.classList.contains('light') ? 'Light theme enabled.' : 'Dark theme enabled.'); });
     $('import-button').addEventListener('click', () => $('file-input').click());
+    $('share-button').addEventListener('click', copyShareLink);
     $('file-input').addEventListener('change', (event) => importCode(event.target.files[0]));
     $('export-button').addEventListener('click', exportCode);
     $('restore-button').addEventListener('click', () => { editor.value = state.snapshot; updateLineNumbers(); updateCursor(); showToast('Last saved version restored.'); });
@@ -2008,6 +2138,8 @@
     quizAnswerValue,
     quizQuestionForStep
   });
+  window.CodeFlowHeat = Object.freeze({ lineHeatFromEvents, lineHeatSummary });
+  window.CodeFlowShare = Object.freeze({ plainSharePayload, decodePlainSharePayload, shareHashFor, decodeShareHash });
 
   function replaceText(allMatches) {
     const editor = $('code-editor');
@@ -2028,7 +2160,7 @@
       state.source = editor ? editor.value : '';
       state.snapshot = state.source;
       state.history = [state.source];
-      updateLineNumbers(); updateCursor(); updateTimeline(); bindEvents(); configureSoundSupport(); configureTeacherSpeech(); refreshHealth();
+      updateLineNumbers(); updateCursor(); updateTimeline(); bindEvents(); configureSoundSupport(); configureTeacherSpeech(); refreshHealth(); loadSharedHash();
     } catch (error) {
       // Keep the page usable even if a browser extension changes the DOM.
       setText('run-status', 'Ready — some optional controls are unavailable');

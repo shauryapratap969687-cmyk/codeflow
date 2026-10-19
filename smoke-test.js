@@ -29,7 +29,9 @@ const checks = [
   ['call tree view', html.includes('id="call-tree-view-tab"') && html.includes('id="call-tree-panel"') && js.includes('buildCallTree')],
   ['call tree accessibility', js.includes('role="button"') && js.includes('call-tree-node') && js.includes('prepareCallTree')],
   ['debug panel', html.includes('id="expected-output"') && html.includes('id="debug-compare"') && js.includes('compareDebugOutput')],
-  ['quiz controls', html.includes('id="quiz-toggle"') && html.includes('id="quiz-panel"') && js.includes('quizQuestionForStep')]
+  ['quiz controls', html.includes('id="quiz-toggle"') && html.includes('id="quiz-panel"') && js.includes('quizQuestionForStep')],
+  ['share and heat controls', html.includes('id="share-button"') && html.includes('id="line-heat-summary"') && js.includes('shareHashFor') && js.includes('lineHeatFromEvents')],
+  ['demo gallery', ['buggy-sum', 'fibonacci', 'bubble-sort', 'string-reversal', 'list-dict', 'runtime-error'].every((name) => html.includes(`data-example="${name}"`) && (js.includes(`'${name}'`) || js.includes(`${name}:`)))]
 ];
 if (/coldchain|cold-chain/i.test(html + js + backend)) throw new Error('Standalone folder contains an unrelated product reference');
 const failed = checks.filter(([, passed]) => !passed);
