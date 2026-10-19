@@ -2,6 +2,31 @@
 
 CodeFlow is a standalone frontend and Python backend for learning and visualizing code execution. The backend has no project imports and uses only the Python standard library plus FastAPI/uvicorn when those packages are already installed.
 
+## What problem this solves
+
+Beginners can see that code ran, but not why a value changed, where a repeated call came from, or which recorded step produced an unexpected output. CodeFlow keeps the user's source beside a bounded execution trace and turns that evidence into a timeline, Teacher narration, a Value Journey, a Call tree, data-structure cells, Debug evidence, and an optional prediction quiz.
+
+## Feature map
+
+- **Teacher mode** — trace-derived Simple/Detailed Value Journey, English/Hindi captions, optional browser speech, replay, and keyboard navigation.
+- **Call tree** — inline SVG call/return tree with recorded arguments, returns, repeated-call badges, selection highlighting, and a visible-node cap.
+- **Data structures** — type-aware list/tuple/set/dict/string/scalar cells with added, removed, and changed markers.
+- **Debug mode** — compare expected output, show whitespace visibly, map output lines to recorded trace steps, and inspect the last recorded write for values read by the line.
+- **Quiz mode** — optional playback pauses that ask for a recorded scalar/list result or a branch outcome before revealing it.
+- **Sharing and heat** — copy a code-containing URL hash without auto-running it, show recorded line heat, and load six plain-data demo samples.
+
+### Architecture
+
+```text
+editor + controls
+       │
+       ├── /api/execute ── bounded Python/Node worker ── events + snapshots + metadata
+       │                                              │
+       └── frontend renderers ── timeline / Teacher / Call tree / Debug / Quiz / heat
+```
+
+The frontend never needs a build step or external script. The backend is the source of runtime values; visual explanations label missing evidence as unknown.
+
 ## Run it
 
 Open `index.html` in a modern browser for the offline frontend, or start the backend from this folder:
@@ -93,6 +118,25 @@ Python programs run in a bounded child process with captured stdout/stderr, synt
 - A 4xx API response is shown as a request/diagnostic error in the UI instead
   of being misreported as offline mode.
 
+## Security
+
+The backend runs user Python in a short-lived child process with a minimal environment, audit-hook restrictions, bounded time/output/events/result size, concurrency and rate limits, and memory limits where the host supports them. It blocks process/socket access, `/proc` access where applicable, and writes outside a temporary work folder. JavaScript runs in a restricted Node VM with no host `process` or `require` access and bounded timers. Static serving is an explicit allowlist.
+
+These controls are defense-in-depth for a teaching service, not a replacement for a hardened multi-tenant sandbox or an operating-system container. Do not treat public CodeFlow as a place to run secrets or hostile workloads.
+
+## Limitations
+
+- Python tracing is capped at 500 recorded events; long runs are marked truncated and the UI says when counts/evidence cover recorded steps only.
+- JavaScript executes when Node is available, but Teacher-style Python tracing is intentionally unavailable and is reported as output-only.
+- `input()` is not supported because runs are non-interactive; assign a sample value instead.
+- Browser speech depends on the operating system's Web Speech voices. Captions remain available without speech.
+- Share links contain the source code in the URL hash. Review the code before sharing and remember that URL history may retain it.
+
+## Screenshots and live demo
+
+- Screenshots/GIF: **TODO — add project screenshots here.**
+- Live URL: **TODO — add the deployed URL here.**
+
 ### Configure remote AI
 
 Set the key before starting `backend.py`. `CODEFLOW_AI_BASE_URL` is optional and defaults to `https://api.openai.com/v1`; it may also be a complete `/chat/completions` URL. `CODEFLOW_AI_MODEL` is optional and defaults to `gpt-4o-mini`.
@@ -133,8 +177,8 @@ For an OpenAI-compatible local provider, replace `CODEFLOW_AI_BASE_URL` and `COD
 ```bash
 node --check app.js
 node smoke-test.js
-node teacher-test.js
+npm test
 python -m unittest discover -s tests -v
 ```
 
-The JavaScript smoke test is dependency-free and checks the static entry point. `teacher-test.js` loads the actual browser bundle in a small VM harness and verifies non-empty, value-preserving narration for ten arbitrary trace shapes plus Hindi output. The Python tests exercise execution, Teacher metadata and ten arbitrary programs, limits/diagnostics, verification, JavaScript capability handling, missing AI credentials, a mocked structured provider response with a proposed code change, sandbox boundaries, rate limits, result-size robustness, and static-file exposure. The hardening suite is in `tests/test_hardening.py`.
+The JavaScript smoke test is dependency-free and checks the static entry point. `npm test` also runs DOM-free VM checks for Teacher narration, Call tree, data structures, Debug mode, Quiz mode, sharing, and line heat. The Python tests exercise execution, Teacher metadata and ten arbitrary programs, limits/diagnostics, verification, JavaScript capability handling, missing AI credentials, a mocked structured provider response with a proposed code change, sandbox boundaries, rate limits, result-size robustness, and static-file exposure. The hardening suite is in `tests/test_hardening.py`.

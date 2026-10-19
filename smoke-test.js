@@ -31,7 +31,9 @@ const checks = [
   ['debug panel', html.includes('id="expected-output"') && html.includes('id="debug-compare"') && js.includes('compareDebugOutput')],
   ['quiz controls', html.includes('id="quiz-toggle"') && html.includes('id="quiz-panel"') && js.includes('quizQuestionForStep')],
   ['share and heat controls', html.includes('id="share-button"') && html.includes('id="line-heat-summary"') && js.includes('shareHashFor') && js.includes('lineHeatFromEvents')],
-  ['demo gallery', ['buggy-sum', 'fibonacci', 'bubble-sort', 'string-reversal', 'list-dict', 'runtime-error'].every((name) => html.includes(`data-example="${name}"`) && (js.includes(`'${name}'`) || js.includes(`${name}:`)))]
+  ['demo gallery', ['buggy-sum', 'fibonacci', 'bubble-sort', 'string-reversal', 'list-dict', 'runtime-error'].every((name) => html.includes(`data-example="${name}"`) && (js.includes(`'${name}'`) || js.includes(`${name}:`)))],
+  ['waking message', js.includes('Server is waking up (free hosting)') && js.includes('4000')],
+  ['demo query', js.includes("params.get('demo')") && js.includes("loadExample('buggy-sum')")]
 ];
 if (/coldchain|cold-chain/i.test(html + js + backend)) throw new Error('Standalone folder contains an unrelated product reference');
 const failed = checks.filter(([, passed]) => !passed);

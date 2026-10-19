@@ -39,9 +39,10 @@
     quizAsked: 0,
     quizCorrect: 0,
     quizStreak: 0,
-    quizBestStreak: 0
-    ,lineHeat: {}
-    ,lineHeatTruncated: false
+    quizBestStreak: 0,
+    lineHeat: {},
+    lineHeatTruncated: false,
+    healthChecked: false
   };
 
   const $ = (id) => document.getElementById(id);
@@ -638,6 +639,12 @@
   }
 
   async function refreshHealth() {
+    let slow = false;
+    const wakeTimer = window.setTimeout(() => {
+      slow = true;
+      const note = $('offline-note');
+      if (note) note.innerHTML = '<span>◌</span> Server is waking up (free hosting), please wait…';
+    }, 4000);
     try {
       const response = await fetch('/api/health');
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -648,6 +655,13 @@
     } catch (_) {
       setApiStatus(false);
       setAiProviderStatus('local', 'Local fallback · backend unavailable');
+      if (slow) {
+        const note = $('offline-note');
+        if (note) note.innerHTML = '<span>◌</span> Server is waking up (free hosting), please wait…';
+      }
+    } finally {
+      window.clearTimeout(wakeTimer);
+      state.healthChecked = true;
     }
   }
 
@@ -1991,6 +2005,18 @@
     if (editor && examples[name]) { editor.value = examples[name]; state.language = 'python'; $('language-select').value = 'python'; updateLineNumbers(); updateCursor(); saveSnapshot(); showToast(`${name[0].toUpperCase()}${name.slice(1)} example loaded.`); }
   }
 
+  function openDemoFromQuery() {
+    if (typeof location === 'undefined' || !location.search) return;
+    const params = new URLSearchParams(location.search);
+    if (params.get('demo') !== '1') return;
+    loadExample('buggy-sum');
+    const panel = $('debug-panel');
+    if (panel && typeof panel.scrollIntoView === 'function') panel.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    const expected = $('expected-output');
+    if (expected) expected.focus();
+    showToast('Demo loaded in Debug mode. Paste the expected output, then compare; it was not auto-run.');
+  }
+
   function bindEvents() {
     const editor = $('code-editor');
     editor.addEventListener('input', () => { updateLineNumbers(); updateCursor(); saveSnapshot(); });
@@ -2160,7 +2186,7 @@
       state.source = editor ? editor.value : '';
       state.snapshot = state.source;
       state.history = [state.source];
-      updateLineNumbers(); updateCursor(); updateTimeline(); bindEvents(); configureSoundSupport(); configureTeacherSpeech(); refreshHealth(); loadSharedHash();
+      updateLineNumbers(); updateCursor(); updateTimeline(); bindEvents(); configureSoundSupport(); configureTeacherSpeech(); refreshHealth(); loadSharedHash().then(openDemoFromQuery);
     } catch (error) {
       // Keep the page usable even if a browser extension changes the DOM.
       setText('run-status', 'Ready — some optional controls are unavailable');
