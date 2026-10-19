@@ -196,3 +196,29 @@ body.light { --bg: #f5f7fb; --surface: #fff; --surface-2: #eef1f8; --surface-3: 
 .inline-heading { gap: 7px; }
 .event-output-inline .console-output { height: calc(100% - 24px); max-height: none; padding: 3px 0 0; }
 .teacher-detailed .teacher-detail-section { padding-left: 3px; border-left: 2px solid var(--purple); }
+
+/* Side-panel sizing: one panel scroll on desktop, natural page flow on mobile. */
+.panel-header { flex-wrap: wrap; align-items: flex-start; }
+.panel-header > div:first-child { min-width: 0; flex: 1 1 auto; }
+.panel-header > .panel-header-actions { min-width: 0; flex: 0 1 auto; }
+.panel-header > .api-badge, .panel-header > .trace-badge, .panel-header > .count-badge, .panel-header > .diagnostic-ok { flex: 0 0 auto; white-space: nowrap; }
+.data-panel, .diagnostics-panel, .selected-step-panel, .console-panel { min-width: 0; overflow-x: hidden; overflow-y: auto; scrollbar-width: thin; scrollbar-color: var(--purple) transparent; }
+.data-panel::-webkit-scrollbar, .diagnostics-panel::-webkit-scrollbar, .selected-step-panel::-webkit-scrollbar, .console-panel::-webkit-scrollbar { width: 6px; }
+.data-panel::-webkit-scrollbar-thumb, .diagnostics-panel::-webkit-scrollbar-thumb, .selected-step-panel::-webkit-scrollbar-thumb, .console-panel::-webkit-scrollbar-thumb { border-radius: 99px; background: var(--purple); }
+.data-list, .changed-list, .stack-list, .diagnostics-output, .console-panel > .console-output, .event-output-inline .console-output { max-height: none; overflow: visible; min-width: 0; }
+.data-row, .stack-row, .diagnostic-line, .console-line, .data-row b, .data-row code, .stack-row b, .stack-row small, .diagnostic-line > div, .console-line > span:last-child { min-width: 0; overflow-wrap: anywhere; }
+.data-row code, .stack-row small, .console-line > span:last-child { white-space: normal; word-break: break-word; }
+.sub-panel-heading { min-width: 0; align-items: flex-start; flex-wrap: wrap; }
+.sub-panel-heading > span:first-child { min-width: 0; flex: 1 1 180px; overflow-wrap: anywhere; }
+.sub-panel-heading > span:last-child { flex: 0 0 auto; white-space: nowrap; }
+.debug-panel { min-width: 0; overflow: visible; }
+.debug-panel .sub-panel-heading { gap: 6px 10px; }
+.debug-panel textarea { width: 100%; min-height: 96px; box-sizing: border-box; resize: vertical; overflow-wrap: anywhere; }
+.debug-actions { flex-wrap: wrap; }
+.debug-actions .button { white-space: nowrap; }
+.teacher-toolbar { flex-wrap: wrap; align-items: flex-start; }
+.teacher-heading { min-width: 0; flex: 1 1 180px; }
+.teacher-toolbar > #teacher-explain { flex: 0 0 auto; white-space: nowrap; }
+.value-journey { min-width: 0; overflow: visible; }
+.journey-source, .substitution-bar { max-width: 100%; overflow: visible; overflow-wrap: anywhere; }
+.journey-source { white-space: pre-wrap; }

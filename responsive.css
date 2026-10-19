@@ -27,12 +27,18 @@ html, body { min-width: 0; overflow-x: hidden; }
   .hero-copy { text-align: center; }.hero-copy > p { margin-inline: auto; }.hero-actions, .hero-proof { justify-content: center; }
   .workspace-grid { grid-template-columns: 1fr; height: auto; }
   .editor-panel { height: 380px; }
-  .right-rail { grid-template-columns: minmax(0, .8fr) minmax(0, 1.2fr); grid-template-rows: 290px; }
+  .right-rail { grid-template-columns: minmax(0, .8fr) minmax(0, 1.2fr); grid-template-rows: auto auto; }
   .workspace-drawer { grid-template-columns: minmax(0, 1.2fr) minmax(210px, .8fr); height: auto; }
   .flow-panel, .data-panel, .console-panel, .diagnostics-panel { min-height: 190px; }
   .diagnostics-panel { grid-column: auto; }
   .diagnostics-panel .diagnostics-output { display: block; }
   .ai-card { grid-template-columns: auto minmax(0, 1fr); }.ai-chat { grid-column: 1 / -1; }
+}
+
+@media (max-width: 900px) {
+  /* Let the document, rather than tiny inner boxes, handle mobile scrolling. */
+  .data-panel, .diagnostics-panel, .selected-step-panel, .console-panel { overflow: visible; }
+  .data-list, .changed-list, .stack-list, .diagnostics-output, .console-panel > .console-output, .event-output-inline .console-output { overflow: visible; max-height: none; }
 }
 
 @media (max-width: 620px) {
