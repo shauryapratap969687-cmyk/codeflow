@@ -8,9 +8,13 @@ handlers are available through the standard-library fallback server.
 from __future__ import annotations
 
 import ast
+import collections
+import datetime
 import json
+import math
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -39,7 +43,28 @@ MAX_AI_PROMPT_BYTES = 8 * 1024
 MAX_AI_CONTEXT_ITEMS = 50
 MAX_AI_ANSWER_BYTES = 16 * 1024
 RESULT_FILE_LIMIT = 256 * 1024
+RESULT_TARGET_BYTES = 200 * 1024  # the worker fits its result under this, below RESULT_FILE_LIMIT
+EVENT_BUDGET_BYTES = 150 * 1024
 RESULT_MARKER = "CodeFlow backend"
+# The only files the static handlers will ever serve (never source, config or .git).
+STATIC_FILES = frozenset({"index.html", "app.js", "styles.css", "responsive.css"})
+PYTHON_MEMORY_LIMIT_BYTES = 768 * 1024 * 1024
+RUN_QUEUE_WAIT_SECONDS = 5.0
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, "").strip() or default)
+    except ValueError:
+        return default
+
+
+# Public-deployment protection. All values can be tuned with environment
+# variables; 0 disables the matching limit.
+MAX_CONCURRENT_RUNS = max(1, _env_int("CODEFLOW_MAX_CONCURRENT", 4))
+RATE_LIMIT_EXECUTE_PER_MINUTE = _env_int("CODEFLOW_RATE_EXECUTE", 60)
+RATE_LIMIT_AI_PER_MINUTE = _env_int("CODEFLOW_RATE_AI", 15)
+AI_DAILY_LIMIT = _env_int("CODEFLOW_AI_DAILY_LIMIT", 500)
 
 
 def _diagnostic(
@@ -104,12 +129,83 @@ def _read_limited(pipe: Any, limit: int) -> tuple[bytes, bool]:
     return bytes(data), truncated
 
 
+_PRIVILEGE_DROP_CACHE: dict[str, tuple[int, int] | None] = {}
+_PRIVILEGE_DROP_LOCK = threading.Lock()
+
+
+def _unprivileged_ids(executable: str, probe_args: list[str]) -> tuple[int, int] | None:
+    """uid/gid of "nobody" when the server runs as root and the interpreter works as that user.
+
+    A child that runs as a different user cannot read the server's /proc entry
+    (environment, memory) or its files. The check is done once per executable so
+    a host where "nobody" cannot run the interpreter simply keeps the old behaviour.
+    """
+    if os.name != "posix" or not hasattr(os, "geteuid") or os.geteuid() != 0:
+        return None
+    with _PRIVILEGE_DROP_LOCK:
+        if executable in _PRIVILEGE_DROP_CACHE:
+            return _PRIVILEGE_DROP_CACHE[executable]
+        ids: tuple[int, int] | None = None
+        try:
+            import pwd
+
+            entry = pwd.getpwnam("nobody")
+            probe = subprocess.run(
+                [executable, *probe_args],
+                cwd="/",
+                env={"PATH": os.environ.get("PATH", "")},
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+                user=entry.pw_uid,
+                group=entry.pw_gid,
+                extra_groups=[],
+            )
+            if probe.returncode == 0:
+                ids = (entry.pw_uid, entry.pw_gid)
+        except Exception:  # noqa: BLE001 - any failure just means "do not drop privileges"
+            ids = None
+        _PRIVILEGE_DROP_CACHE[executable] = ids
+        return ids
+
+
+def _child_options(executable: str, probe_args: list[str], paths: list[Path]) -> dict[str, Any]:
+    """Extra Popen arguments that make the child less powerful than the server."""
+    if os.name != "posix":
+        return {}
+    options: dict[str, Any] = {"start_new_session": True}
+    ids = _unprivileged_ids(executable, probe_args)
+    if ids is not None:
+        try:
+            for path in paths:
+                os.chown(path, ids[0], ids[1])
+            options.update(user=ids[0], group=ids[1], extra_groups=[])
+        except OSError:
+            pass
+    return options
+
+
+def _kill_process_group(process: "subprocess.Popen[bytes]") -> None:
+    try:
+        if os.name == "posix":
+            os.killpg(process.pid, signal.SIGKILL)
+        else:
+            process.kill()
+    except OSError:
+        try:
+            process.kill()
+        except OSError:
+            pass
+
+
 def _run_process(
     command: list[str],
     *,
     cwd: str,
     env: dict[str, str],
     timeout: float = EXECUTION_TIMEOUT_SECONDS,
+    popen_options: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     started = time.monotonic()
     try:
@@ -120,6 +216,7 @@ def _run_process(
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            **(popen_options or {}),
         )
     except OSError as exc:
         return {
@@ -147,7 +244,7 @@ def _run_process(
         process.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         timed_out = True
-        process.kill()
+        _kill_process_group(process)
         process.wait()
     stdout_thread.join(timeout=1)
     stderr_thread.join(timeout=1)
@@ -180,7 +277,106 @@ def _bounded_text(value: str, limit: int = MAX_OUTPUT_BYTES) -> tuple[str, bool]
     return encoded[:limit].decode("utf-8", "replace"), True
 
 
+def _json_safe(value: Any, depth: int = 0) -> Any:
+    """Replace NaN/Infinity (not valid JSON) so every response can be serialised."""
+    if isinstance(value, float):
+        return value if math.isfinite(value) else repr(value)
+    if depth > 40:
+        return value
+    if isinstance(value, dict):
+        return {key: _json_safe(item, depth + 1) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item, depth + 1) for item in value]
+    return value
+
+
+class _RateLimiter:
+    """Small in-memory sliding-window limiter (per key, per process)."""
+
+    def __init__(self) -> None:
+        self._hits: dict[str, collections.deque[float]] = {}
+        self._lock = threading.Lock()
+
+    def allow(self, key: str, limit: int, window_seconds: float = 60.0) -> bool:
+        if limit <= 0:
+            return True
+        now = time.monotonic()
+        with self._lock:
+            hits = self._hits.setdefault(key, collections.deque())
+            while hits and now - hits[0] > window_seconds:
+                hits.popleft()
+            if len(hits) >= limit:
+                return False
+            hits.append(now)
+            if len(self._hits) > 5000:
+                for stale in [name for name, queue in self._hits.items() if not queue or now - queue[-1] > window_seconds]:
+                    del self._hits[stale]
+            return True
+
+
+_RATE_LIMITER = _RateLimiter()
+_RUN_SLOTS = threading.BoundedSemaphore(MAX_CONCURRENT_RUNS)
+_AI_DAILY = {"day": "", "count": 0}
+_AI_DAILY_LOCK = threading.Lock()
+
+
+def _client_ip(forwarded_for: str | None, peer: str | None) -> str:
+    """Best-effort client address. Proxies append the real peer last, so use the last entry."""
+    if forwarded_for:
+        last = forwarded_for.split(",")[-1].strip()
+        if last:
+            return last
+    return peer or "unknown"
+
+
+def _ai_daily_budget_available() -> bool:
+    if AI_DAILY_LIMIT <= 0:
+        return True
+    today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+    with _AI_DAILY_LOCK:
+        if _AI_DAILY["day"] != today:
+            _AI_DAILY["day"] = today
+            _AI_DAILY["count"] = 0
+        if _AI_DAILY["count"] >= AI_DAILY_LIMIT:
+            return False
+        _AI_DAILY["count"] += 1
+        return True
+
+
+def _limited_run_result(language: str, status: str, title: str, detail: str, kind: str) -> dict[str, Any]:
+    """A normal-shaped (HTTP 200) result so the UI shows the reason instead of 'offline mode'."""
+    return {
+        "status": status,
+        "language": language,
+        "output": [],
+        "stdout": "",
+        "stderr": "",
+        "variables": {},
+        "events": [],
+        "call_stack": [],
+        "diagnostics": [_diagnostic(title, detail, kind=kind)],
+    }
+
+
+def _harden_server_process() -> None:
+    """Mark this process non-dumpable (Linux) so same-user child programs cannot read
+    /proc/<server pid>/environ or /proc/<server pid>/mem, which hold the AI key."""
+    if not sys.platform.startswith("linux"):
+        return
+    try:
+        import ctypes
+
+        ctypes.CDLL(None, use_errno=True).prctl(4, 0, 0, 0, 0)  # PR_SET_DUMPABLE = 4
+    except Exception:  # noqa: BLE001 - best effort only
+        pass
+
+
+_harden_server_process()
+
+
 PYTHON_RUNNER = r'''
+import builtins
+import itertools
 import json
 import os
 import sys
@@ -192,7 +388,55 @@ SOURCE_NAME = "codeflow_user.py"
 MAX_EVENTS = int(os.environ.get("CODEFLOW_MAX_EVENTS", "500"))
 MAX_VARIABLES = int(os.environ.get("CODEFLOW_MAX_VARIABLES", "100"))
 MAX_STACK = int(os.environ.get("CODEFLOW_MAX_STACK", "50"))
+RESULT_TARGET = int(os.environ.get("CODEFLOW_RESULT_TARGET", "204800"))
+EVENT_BUDGET = int(os.environ.get("CODEFLOW_EVENT_BUDGET", "153600"))
+MEMORY_LIMIT = int(os.environ.get("CODEFLOW_MEMORY_BYTES", "0"))
 MAX_VALUE = 800
+
+# Resource limits for the user program (POSIX only; skipped where unsupported).
+try:
+    import resource
+    for _name, _limit in (("RLIMIT_AS", MEMORY_LIMIT), ("RLIMIT_FSIZE", 1024 * 1024), ("RLIMIT_CORE", 0)):
+        if _limit or _name == "RLIMIT_CORE":
+            try:
+                resource.setrlimit(getattr(resource, _name), (_limit, _limit))
+            except (ValueError, OSError, AttributeError):
+                pass
+except ImportError:
+    pass
+
+WORKDIR = os.path.realpath(os.path.dirname(SOURCE_PATH))
+BLOCKED_EVENTS = {
+    "subprocess.Popen", "os.system", "os.exec", "os.posix_spawn", "os.spawn", "os.fork",
+    "os.forkpty", "os.startfile", "socket.connect", "socket.bind", "socket.getaddrinfo",
+    "ctypes.dlopen", "ctypes.dlsym",
+}
+WRITE_FLAGS = getattr(os, "O_WRONLY", 1) | getattr(os, "O_RDWR", 2) | getattr(os, "O_CREAT", 64) | getattr(os, "O_TRUNC", 512) | getattr(os, "O_APPEND", 1024)
+
+
+def _guard(event, args):
+    """Audit hook: keep learner programs away from processes, sockets, /proc and files outside the work folder."""
+    if event in BLOCKED_EVENTS:
+        raise PermissionError("CodeFlow does not allow " + event + " in visualized programs.")
+    if event == "open" and args:
+        target = args[0]
+        if isinstance(target, int):
+            return
+        try:
+            real = os.path.realpath(os.fsdecode(target))
+        except (TypeError, ValueError):
+            return
+        if real.startswith(("/proc", "/sys")):
+            raise PermissionError("CodeFlow does not allow reading " + real + ".")
+        mode = args[1] if len(args) > 1 and isinstance(args[1], str) else ""
+        flags = args[2] if len(args) > 2 and isinstance(args[2], int) else 0
+        writing = bool(flags & WRITE_FLAGS) or any(ch in mode for ch in "wax+")
+        if writing and real != os.devnull and not (real == WORKDIR or real.startswith(WORKDIR + os.sep)):
+            raise PermissionError("CodeFlow only allows writing inside its temporary work folder.")
+
+
+def _no_input(prompt=""):
+    raise EOFError("input() is not available in CodeFlow (there is no keyboard input). Assign a sample value instead, for example: name = 'Ada'")
 
 
 class LimitedText:
@@ -225,14 +469,18 @@ class LimitedText:
 def safe_value(value, depth=0):
     if depth > 3:
         return "<nested>"
+    if isinstance(value, float) and (value != value or value in (float("inf"), float("-inf"))):
+        return repr(value)
+    if isinstance(value, int) and not isinstance(value, bool) and value.bit_length() > 4000:
+        return "<very large int, %d bits>" % value.bit_length()
     if value is None or isinstance(value, (bool, int, float, str)):
         if isinstance(value, str) and len(value) > MAX_VALUE:
             return value[:MAX_VALUE] + "…"
         return value
     if isinstance(value, (list, tuple, set)):
-        return [safe_value(item, depth + 1) for item in list(value)[:30]]
+        return [safe_value(item, depth + 1) for item in itertools.islice(value, 30)]
     if isinstance(value, dict):
-        return {str(key)[:80]: safe_value(item, depth + 1) for key, item in list(value.items())[:30]}
+        return {str(key)[:80]: safe_value(item, depth + 1) for key, item in itertools.islice(value.items(), 30)}
     try:
         text = repr(value)
     except Exception:
@@ -251,12 +499,14 @@ def snapshot(values):
 events = []
 stack = []
 events_truncated = False
+event_bytes = 0
+tracing_stopped = False
 
 
 def trace(frame, event, arg):
-    global events_truncated
-    if frame.f_code.co_filename != SOURCE_NAME:
-        return trace
+    global events_truncated, event_bytes, tracing_stopped
+    if tracing_stopped or frame.f_code.co_filename != SOURCE_NAME:
+        return None
     function = frame.f_code.co_name
     if event == "call":
         if len(stack) < MAX_STACK:
@@ -266,6 +516,7 @@ def trace(frame, event, arg):
     else:
         event_name = event
     if event in ("call", "line", "return", "exception"):
+        recorded = False
         if len(events) < MAX_EVENTS:
             item = {
                 "sequence": len(events),
@@ -277,12 +528,40 @@ def trace(frame, event, arg):
             }
             if event == "exception" and isinstance(arg, tuple) and len(arg) > 1:
                 item["exception"] = str(arg[1])[:MAX_VALUE]
-            events.append(item)
-        else:
+            size = len(json.dumps(item, ensure_ascii=False, default=str))
+            if event_bytes + size <= EVENT_BUDGET:
+                event_bytes += size
+                events.append(item)
+                recorded = True
+        if not recorded:
+            # Event count or size budget reached: stop tracing so the program still
+            # finishes quickly and the result always fits in the response.
             events_truncated = True
+            tracing_stopped = True
+            sys.settrace(None)
+            return None
     if event == "return" and stack:
         stack.pop()
     return trace
+
+
+def fit_result(meta):
+    """Serialise the result, shrinking it (events first, then variables) until it fits."""
+    def encode():
+        text = json.dumps(meta, ensure_ascii=False)
+        return text, len(text.encode("utf-8", "replace"))
+    text, size = encode()
+    while size > RESULT_TARGET and meta["events"]:
+        meta["events"] = meta["events"][: len(meta["events"]) // 2]
+        meta["events_truncated"] = True
+        text, size = encode()
+    if size > RESULT_TARGET:
+        meta["variables"] = {key: (value if isinstance(value, (bool, int, float, type(None))) else str(value)[:120]) for key, value in meta["variables"].items()}
+        text, size = encode()
+    if size > RESULT_TARGET:
+        meta["variables"] = {}
+        text, size = encode()
+    return text
 
 
 stdout_capture = LimitedText(16384)
@@ -318,6 +597,8 @@ try:
             "end_column": getattr(exc, "end_offset", None),
         }]
     else:
+        builtins.input = _no_input
+        sys.addaudithook(_guard)
         sys.settrace(trace)
         try:
             exec(compiled, namespace, namespace)
@@ -341,13 +622,14 @@ finally:
 metadata["events"] = events
 metadata["events_truncated"] = events_truncated
 metadata["variables"] = snapshot(namespace)
-metadata["call_stack"] = list(stack[-MAX_STACK:])
+metadata["call_stack"] = [] if tracing_stopped else list(stack[-MAX_STACK:])
 metadata["stdout"] = stdout_capture.getvalue()
 metadata["stderr"] = stderr_capture.getvalue()
 metadata["stdout_truncated"] = stdout_capture.truncated
 metadata["stderr_truncated"] = stderr_capture.truncated
-with open(RESULT_PATH, "w", encoding="utf-8") as result_file:
-    json.dump(metadata, result_file, ensure_ascii=False)
+result_text = fit_result(metadata)
+with open(RESULT_PATH, "w", encoding="utf-8", errors="replace") as result_file:
+    result_file.write(result_text)
 '''
 
 
@@ -424,17 +706,27 @@ def execute_python(source: str) -> dict[str, Any]:
         source_path = work / "source.py"
         result_path = work / "result.json"
         source_path.write_text(source, encoding="utf-8")
+        # Deliberately minimal environment: the AI key and other server secrets never reach user code.
         env = {
             "PATH": os.environ.get("PATH", ""),
             "PYTHONIOENCODING": "utf-8",
+            "PYTHONDONTWRITEBYTECODE": "1",
             "CODEFLOW_MAX_EVENTS": str(MAX_EVENTS),
             "CODEFLOW_MAX_VARIABLES": str(MAX_VARIABLES),
             "CODEFLOW_MAX_STACK": str(MAX_STACK),
+            "CODEFLOW_MEMORY_BYTES": str(PYTHON_MEMORY_LIMIT_BYTES),
         }
+        if os.name == "nt" and os.environ.get("SYSTEMROOT"):
+            env["SYSTEMROOT"] = os.environ["SYSTEMROOT"]
         child = _run_process(
             [sys.executable, "-I", "-S", "-c", PYTHON_RUNNER, str(source_path), str(result_path)],
             cwd=workdir,
             env=env,
+            popen_options=_child_options(
+                sys.executable,
+                ["-I", "-S", "-c", "import json, os, sys, traceback, itertools, builtins, resource"],
+                [work, source_path],
+            ),
         )
         result = _python_result_from_child(child, result_path)
         result["duration_ms"] = round((time.monotonic() - child["started"]) * 1000, 2)
@@ -447,60 +739,205 @@ const vm = require("vm");
 const sourcePath = process.argv[1];
 const resultPath = process.argv[2];
 const source = fs.readFileSync(sourcePath, "utf8");
-const limit = 16384;
+const LIMIT = 16384;
+const MAX_TIMER_RUNS = 1000;
+const MAX_VARIABLES = 100;
 const output = [];
 const errors = [];
 let outputSize = 0;
-function bounded(target, args) {
-  const text = args.map((value) => {
-    try { return typeof value === "string" ? value : JSON.stringify(value); }
-    catch (_) { return String(value); }
-  }).join(" ");
-  if (outputSize < limit) {
-    target.push(text.slice(0, limit - outputSize));
-    outputSize += Math.min(text.length, limit - outputSize);
+
+function bounded(target, text) {
+  if (outputSize < LIMIT) {
+    target.push(text.slice(0, LIMIT - outputSize));
+    outputSize += Math.min(text.length, LIMIT - outputSize);
   }
 }
-const sandbox = {
-  console: {
-    log: (...args) => bounded(output, args),
-    info: (...args) => bounded(output, args),
-    warn: (...args) => bounded(errors, args),
-    error: (...args) => bounded(errors, args),
-  },
-};
+
+// Host-side helpers. They are handed to the sandbox only through the bootstrap
+// closure below and only ever receive/return primitives or sandbox objects.
+function hostPrint(kind, text) { bounded(kind === 1 ? errors : output, String(text)); }
+
+let virtualNow = 0;
+let order = 0;
+let nextId = 0;
+let timersRun = 0;
+const timers = new Map();
+function hostSchedule(fn, delay, args, interval, immediate) {
+  let wait = immediate ? 0 : Number(delay);
+  if (!(wait >= 1)) wait = immediate ? 0 : 1;
+  if (wait > 2147483647) wait = 1;
+  const id = ++nextId;
+  timers.set(id, { id, fn, args, time: virtualNow + wait, order: ++order, interval: interval ? wait : 0 });
+  return id;
+}
+function hostCancel(id) { timers.delete(Number(id)); }
+
+const bootstrapSource = `(function (hostPrint, hostSchedule, hostCancel) {
+  "use strict";
+  const fmt = (v) => {
+    if (typeof v === "string") return v;
+    try { const s = JSON.stringify(v); return s === undefined ? String(v) : s; } catch (_) { return String(v); }
+  };
+  const write = (kind) => (...args) => { hostPrint(kind, args.map(fmt).join(" ")); };
+  const define = (name, value) => Object.defineProperty(globalThis, name, { value, writable: true, configurable: true, enumerable: false });
+  define("console", { log: write(0), info: write(0), debug: write(0), warn: write(1), error: write(1) });
+  const timer = (interval, immediate) => function (fn, delay, ...rest) {
+    if (typeof fn !== "function") throw new TypeError("The callback argument must be of type function.");
+    return hostSchedule(fn, Number(delay), rest, interval, immediate);
+  };
+  define("setTimeout", timer(false, false));
+  define("setInterval", timer(true, false));
+  define("setImmediate", timer(false, true));
+  const cancel = (id) => { hostCancel(Number(id)); };
+  define("clearTimeout", cancel);
+  define("clearInterval", cancel);
+  define("clearImmediate", cancel);
+  define("queueMicrotask", (fn) => { Promise.resolve().then(fn); });
+})`;
+
 const result = { status: "completed", diagnostics: [], variables: {}, events: [], call_stack: [] };
-try {
-  const context = vm.createContext(sandbox);
-  const script = new vm.Script(source, { filename: "codeflow_user.js", displayErrors: true });
-  script.runInContext(context, { timeout: 2000, displayErrors: true });
-  for (const [key, value] of Object.entries(sandbox)) {
-    if (key === "console" || key.startsWith("_")) continue;
-    try { result.variables[key] = JSON.parse(JSON.stringify(value)); }
-    catch (_) { result.variables[key] = String(value); }
+let failed = false;
+
+function record(error) {
+  if (failed) return;
+  failed = true;
+  let name = "JavaScriptError";
+  let message = "";
+  let stack = "";
+  try {
+    name = String(error && error.name ? error.name : "JavaScriptError");
+    message = String(error && error.message ? error.message : error);
+    stack = String(error && error.stack ? error.stack : "");
+  } catch (_) {
+    message = "The program threw a value that could not be printed.";
   }
-} catch (error) {
-  const message = String(error && error.message ? error.message : error);
-  const stack = String(error && error.stack ? error.stack : "");
   const match = stack.match(/codeflow_user\.js:(\d+)(?::(\d+))?/);
   result.status = "error";
   result.diagnostics.push({
-    kind: error && error.name === "SyntaxError" ? "syntax" : "runtime",
-    title: error && error.name ? error.name : "JavaScriptError",
+    kind: name === "SyntaxError" ? "syntax" : "runtime",
+    title: name,
     message,
     detail: message,
     line: match ? Number(match[1]) : null,
     column: match && match[2] ? Number(match[2]) : null,
   });
 }
-result.output = output;
-result.stderr = errors.join("\n");
-fs.writeFileSync(resultPath, JSON.stringify(result), "utf8");
+process.on("unhandledRejection", (reason) => record(reason));
+process.on("uncaughtException", (error) => record(error));
+
+const sandbox = Object.create(null);
+const context = vm.createContext(sandbox, { codeGeneration: { strings: false, wasm: false } });
+vm.runInContext(bootstrapSource, context, { timeout: 1000 })(hostPrint, hostSchedule, hostCancel);
+
+function snapshotValue(value) {
+  try {
+    if (typeof value === "number" && !Number.isFinite(value)) return String(value);
+    if (typeof value === "function") return String(value).slice(0, 200);
+    const text = JSON.stringify(value);
+    if (text === undefined) return String(value).slice(0, 200);
+    if (text.length > 2000) return text.slice(0, 2000) + "…";
+    return JSON.parse(text);
+  } catch (_) {
+    try { return String(value).slice(0, 200); } catch (__) { return "<unrepresentable>"; }
+  }
+}
+
+function collectVariables() {
+  const variables = {};
+  let count = 0;
+  try {
+    for (const key of Object.keys(sandbox)) {
+      if (key.startsWith("_") || count >= MAX_VARIABLES) continue;
+      variables[key] = snapshotValue(sandbox[key]);
+      count += 1;
+    }
+  } catch (_) { /* keep what was collected */ }
+  // let / const / class declarations are not properties of the global object, so read them by name.
+  const declared = new Set();
+  const pattern = /(?:^|[\n;{}])[ \t]*(?:let|const|class)\s+([A-Za-z_$][\w$]*)/g;
+  let match;
+  while ((match = pattern.exec(source)) !== null) declared.add(match[1]);
+  for (const name of declared) {
+    if (count >= MAX_VARIABLES) break;
+    if (Object.prototype.hasOwnProperty.call(variables, name) || name.startsWith("_")) continue;
+    try {
+      variables[name] = snapshotValue(vm.runInContext(name, context, { timeout: 200 }));
+      count += 1;
+    } catch (_) { /* block scoped or not initialised yet */ }
+  }
+  return variables;
+}
+
+async function settle() { await new Promise((resolve) => setImmediate(resolve)); }
+
+async function main() {
+  try {
+    const script = new vm.Script(source, { filename: "codeflow_user.js", displayErrors: true });
+    script.runInContext(context, { timeout: 1500, displayErrors: true });
+  } catch (error) {
+    record(error);
+  }
+  if (!failed) await settle();
+  // Virtual-time event loop: timers fire in (time, creation) order without real waiting.
+  while (!failed && timers.size) {
+    if (timersRun >= MAX_TIMER_RUNS) {
+      const limit = new Error("Stopped after " + MAX_TIMER_RUNS + " timer callbacks (possible endless setInterval).");
+      limit.name = "TimerLimit";
+      record(limit);
+      break;
+    }
+    let next = null;
+    for (const item of timers.values()) {
+      if (!next || item.time < next.time || (item.time === next.time && item.order < next.order)) next = item;
+    }
+    virtualNow = next.time;
+    if (next.interval) { next.time = virtualNow + next.interval; next.order = ++order; } else { timers.delete(next.id); }
+    timersRun += 1;
+    try { Reflect.apply(next.fn, undefined, next.args); } catch (error) { record(error); break; }
+    await settle();
+  }
+}
+
+function finish() {
+  result.variables = collectVariables();
+  result.output = output;
+  result.stderr = errors.join("\n");
+  fs.writeFileSync(resultPath, JSON.stringify(result), "utf8");
+}
+main().then(finish, (error) => { record(error); finish(); });
 '''
 
 
 def _node_command() -> str | None:
     return shutil.which("node") or shutil.which("nodejs")
+
+
+_NODE_PERMISSION_FLAG: dict[str, str | None] = {}
+
+
+def _node_permission_flag(node: str) -> str | None:
+    """Node's permission model (blocks child processes and files outside the work folder), if this Node has it."""
+    if node in _NODE_PERMISSION_FLAG:
+        return _NODE_PERMISSION_FLAG[node]
+    flag: str | None = None
+    for candidate in ("--permission", "--experimental-permission"):
+        try:
+            probe = subprocess.run(
+                [node, candidate, "-e", "0"],
+                cwd=tempfile.gettempdir(),
+                env={"PATH": os.environ.get("PATH", ""), "NODE_NO_WARNINGS": "1"},
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if probe.returncode == 0:
+            flag = candidate
+            break
+    _NODE_PERMISSION_FLAG[node] = flag
+    return flag
 
 
 def execute_javascript(source: str) -> dict[str, Any]:
@@ -527,13 +964,26 @@ def execute_javascript(source: str) -> dict[str, Any]:
         source_path = work / "source.js"
         result_path = work / "result.json"
         source_path.write_text(source, encoding="utf-8")
-        env = os.environ.copy()
-        env["NODE_NO_WARNINGS"] = "1"
-        child = _run_process(
-            [node, "-e", JS_RUNNER, "--", str(source_path), str(result_path)],
-            cwd=workdir,
-            env=env,
-        )
+        # Minimal environment: the server's secrets (AI key, etc.) are never passed to user code.
+        env = {"PATH": os.environ.get("PATH", ""), "NODE_NO_WARNINGS": "1"}
+        if os.name == "nt" and os.environ.get("SYSTEMROOT"):
+            env["SYSTEMROOT"] = os.environ["SYSTEMROOT"]
+        options = _child_options(node, ["-e", "require('fs'); require('vm')"], [work, source_path])
+        permission_flag = _node_permission_flag(node)
+        real_workdir = os.path.realpath(workdir)
+        attempts = [True, False] if permission_flag else [False]
+        child: dict[str, Any] = {}
+        for use_permission in attempts:
+            command = [node, "--max-old-space-size=128"]
+            if use_permission and permission_flag:
+                command += [permission_flag, f"--allow-fs-read={real_workdir}", f"--allow-fs-write={real_workdir}"]
+            command += ["-e", JS_RUNNER, "--", str(source_path), str(result_path)]
+            child = _run_process(command, cwd=workdir, env=env, popen_options=options)
+            if child.get("timed_out") or result_path.exists():
+                break
+            if use_permission:
+                # The permission model did not work on this host; remember that and run without it.
+                _NODE_PERMISSION_FLAG[node] = None
         stdout = _decode(child["stdout"])
         stderr = _decode(child["stderr"])
         if child.get("timed_out"):
@@ -549,7 +999,9 @@ def execute_javascript(source: str) -> dict[str, Any]:
                 "diagnostics": [_diagnostic("Execution timed out", "JavaScript execution exceeded the 2-second limit.", kind="timeout")],
             }
         try:
-            metadata = json.loads(result_path.read_text(encoding="utf-8")) if result_path.exists() else {}
+            metadata = {}
+            if result_path.exists() and result_path.stat().st_size <= RESULT_FILE_LIMIT:
+                metadata = json.loads(result_path.read_text(encoding="utf-8"))
         except (OSError, ValueError, json.JSONDecodeError):
             metadata = {}
         if not metadata:
@@ -585,21 +1037,39 @@ def execute_javascript(source: str) -> dict[str, Any]:
         }
 
 
-def execute_payload(payload: Any) -> tuple[dict[str, Any], int]:
+def execute_payload(payload: Any, client: str | None = None) -> tuple[dict[str, Any], int]:
+    """Run a program. `client` (an address) enables per-client rate limiting; omit it to skip that."""
     validated = _validate_payload(payload)
     if validated[0] is None:
         return validated[1], HTTPStatus.BAD_REQUEST
     language, source = validated
-    result = execute_python(source) if language == "python" else execute_javascript(source)
+    if client is not None and not _RATE_LIMITER.allow(f"run:{client}", RATE_LIMIT_EXECUTE_PER_MINUTE):
+        return _limited_run_result(
+            language, "rate-limited", "Too many runs",
+            "You are running code too quickly. Wait a few seconds and try again.", "rate-limit",
+        ), HTTPStatus.OK
+    # Bound how many programs run at once so a burst cannot exhaust the host.
+    if not _RUN_SLOTS.acquire(timeout=RUN_QUEUE_WAIT_SECONDS):
+        return _limited_run_result(
+            language, "busy", "Server busy",
+            "Too many programs are running right now. Try again in a few seconds.", "busy",
+        ), HTTPStatus.OK
+    try:
+        result = execute_python(source) if language == "python" else execute_javascript(source)
+    finally:
+        _RUN_SLOTS.release()
     result.setdefault("request", {"language": language})
-    return result, HTTPStatus.OK
+    return _json_safe(result), HTTPStatus.OK
 
 
-def verify_payload(payload: Any) -> tuple[dict[str, Any], int]:
+def verify_payload(payload: Any, client: str | None = None) -> tuple[dict[str, Any], int]:
     validated = _validate_payload(payload)
     if validated[0] is None:
         return validated[1], HTTPStatus.BAD_REQUEST
     language, source = validated
+    if client is not None and not _RATE_LIMITER.allow(f"run:{client}", RATE_LIMIT_EXECUTE_PER_MINUTE):
+        diagnostic = _diagnostic("Too many requests", "You are verifying code too quickly. Wait a few seconds and try again.", kind="rate-limit")
+        return {"valid": False, "language": language, "errors": [diagnostic], "diagnostics": [diagnostic]}, HTTPStatus.OK
     if language == "python":
         try:
             ast.parse(source, filename="codeflow_user.py", mode="exec")
@@ -714,7 +1184,7 @@ def _structured_ai_content(content: Any) -> tuple[str, dict[str, Any]]:
     return answer.strip(), {"proposed_code": proposed} if proposed is not None else {}
 
 
-def ai_payload(payload: Any) -> tuple[dict[str, Any], int]:
+def ai_payload(payload: Any, client: str | None = None) -> tuple[dict[str, Any], int]:
     if not isinstance(payload, dict):
         return {"error": "Request body must be a JSON object."}, HTTPStatus.BAD_REQUEST
     prompt = payload.get("prompt", "")
@@ -757,6 +1227,21 @@ def ai_payload(payload: Any) -> tuple[dict[str, Any], int]:
             configured=False,
             kind="configuration",
         ), HTTPStatus.OK
+    # Protect the owner's API key/credit on a public deployment: per-client rate limit plus a daily cap.
+    if client is not None and not _RATE_LIMITER.allow(f"ai:{client}", RATE_LIMIT_AI_PER_MINUTE):
+        return dict(_ai_error(
+            "Too many AI requests",
+            "You are asking the AI too quickly. Wait a moment and try again.",
+            configured=True,
+            kind="rate-limit",
+        ), message="Too many AI requests right now. Please wait a moment and try again."), HTTPStatus.OK
+    if not _ai_daily_budget_available():
+        return dict(_ai_error(
+            "AI daily limit reached",
+            "The daily AI request limit for this deployment has been reached.",
+            configured=True,
+            kind="rate-limit",
+        ), message="The daily AI request limit for this deployment has been reached. Try again tomorrow."), HTTPStatus.OK
     normalized_language = "javascript" if language.lower() == "js" else language.lower()
     context = {
         "language": normalized_language,
@@ -837,6 +1322,9 @@ def health_payload() -> dict[str, Any]:
 
 
 def _safe_static_path(relative: str) -> Path | None:
+    # Serve only the frontend files. Source code, config, tests and .git are never exposed.
+    if relative not in STATIC_FILES:
+        return None
     candidate = (BASE_DIR / relative).resolve()
     try:
         candidate.relative_to(BASE_DIR)
@@ -847,6 +1335,7 @@ def _safe_static_path(relative: str) -> Path | None:
 
 try:
     from fastapi import FastAPI, Request
+    from fastapi.concurrency import run_in_threadpool
     from fastapi.responses import FileResponse, JSONResponse, Response
 
     FASTAPI_AVAILABLE = True
@@ -871,12 +1360,18 @@ if FASTAPI_AVAILABLE:
     async def health() -> dict[str, Any]:
         return health_payload()
 
+    def _fastapi_client(request: Request) -> str:
+        peer = request.client.host if request.client else None
+        return _client_ip(request.headers.get("x-forwarded-for"), peer)
+
+    # The handlers below run the blocking work (child processes, the AI HTTP call)
+    # in a worker thread so one slow program never freezes the whole server.
     @app.post("/api/execute")
     async def execute(request: Request) -> Response:
         payload, error = await _fastapi_json(request)
         if error:
             return error
-        result, status = execute_payload(payload)
+        result, status = await run_in_threadpool(execute_payload, payload, _fastapi_client(request))
         return JSONResponse(result, status_code=status)
 
     @app.post("/api/verify")
@@ -884,7 +1379,7 @@ if FASTAPI_AVAILABLE:
         payload, error = await _fastapi_json(request)
         if error:
             return error
-        result, status = verify_payload(payload)
+        result, status = await run_in_threadpool(verify_payload, payload, _fastapi_client(request))
         return JSONResponse(result, status_code=status)
 
     @app.post("/api/ai")
@@ -892,7 +1387,7 @@ if FASTAPI_AVAILABLE:
         payload, error = await _fastapi_json(request)
         if error:
             return error
-        result, status = ai_payload(payload)
+        result, status = await run_in_threadpool(ai_payload, payload, _fastapi_client(request))
         return JSONResponse(result, status_code=status)
 
     @app.get("/")
@@ -913,6 +1408,10 @@ class CodeFlowHandler(BaseHTTPRequestHandler):
     """Small fallback HTTP server using exactly the same endpoint functions."""
 
     server_version = "CodeFlow/1.0"
+    timeout = 20  # seconds; a client that stalls mid-request cannot hold a thread forever
+
+    def _client(self) -> str:
+        return _client_ip(self.headers.get("X-Forwarded-For"), self.client_address[0] if self.client_address else None)
 
     def _send_json(self, payload: dict[str, Any], status: int = 200) -> None:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -923,10 +1422,11 @@ class CodeFlowHandler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self) -> None:  # noqa: N802
-        if self.path == "/api/health":
+        route = self.path.split("?", 1)[0]
+        if route == "/api/health":
             self._send_json(health_payload())
             return
-        relative = "index.html" if self.path == "/" else self.path.split("?", 1)[0].lstrip("/")
+        relative = "index.html" if route == "/" else route.lstrip("/")
         path = _safe_static_path(relative)
         if path is None:
             self._send_json({"error": "Not found"}, 404)
@@ -944,13 +1444,17 @@ class CodeFlowHandler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_POST(self) -> None:  # noqa: N802
-        if self.path not in {"/api/execute", "/api/verify", "/api/ai"}:
+        route = self.path.split("?", 1)[0]
+        if route not in {"/api/execute", "/api/verify", "/api/ai"}:
             self._send_json({"error": "Not found"}, 404)
             return
         try:
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
             length = 0
+        if length < 0:
+            self._send_json({"error": "Invalid Content-Length."}, 400)
+            return
         if length > MAX_REQUEST_BYTES:
             self._send_json({"error": "Request body exceeds the 128 KiB limit."}, 413)
             return
@@ -959,12 +1463,12 @@ class CodeFlowHandler(BaseHTTPRequestHandler):
         except (UnicodeDecodeError, json.JSONDecodeError):
             self._send_json({"error": "Request body must be valid JSON."}, 400)
             return
-        function: Callable[[Any], tuple[dict[str, Any], int]] = {
+        function: Callable[..., tuple[dict[str, Any], int]] = {
             "/api/execute": execute_payload,
             "/api/verify": verify_payload,
             "/api/ai": ai_payload,
-        }[self.path]
-        result, status = function(payload)
+        }[route]
+        result, status = function(payload, self._client())
         self._send_json(result, int(status))
 
     def log_message(self, format: str, *args: Any) -> None:

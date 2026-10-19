@@ -16,8 +16,15 @@
     executedSource: '',
     activeLine: null,
     audioContext: null,
+    soundMasterGain: null,
+    soundCompressor: null,
+    activeVoices: new Set(),
     soundEnabled: false,
-    soundUnlocking: false
+    soundUnlocking: false,
+    animationFrame: null,
+    animationToken: 0,
+    soundPulseToken: 0,
+    playbackToken: 0
   };
 
   const $ = (id) => document.getElementById(id);
@@ -43,6 +50,26 @@
 
   function setSoundStatus(message) {
     setText('sound-status', message);
+  }
+
+  function pulseSoundStatus(event) {
+    const status = $('sound-status');
+    const button = $('sound-toggle');
+    const token = ++state.soundPulseToken;
+    const type = eventType(event);
+    setSoundStatus(`Sound on · ${type} tone fired`);
+    [status, button].filter(Boolean).forEach((element) => {
+      element.classList.remove('sound-fired');
+      element.dataset.toneType = type;
+    });
+    window.requestAnimationFrame(() => {
+      if (token !== state.soundPulseToken) return;
+      [status, button].filter(Boolean).forEach((element) => element.classList.add('sound-fired'));
+      window.setTimeout(() => {
+        if (token !== state.soundPulseToken) return;
+        [status, button].filter(Boolean).forEach((element) => element.classList.remove('sound-fired'));
+      }, 460);
+    });
   }
 
   function updateSoundControl() {
@@ -71,14 +98,45 @@
     if (!AudioContext) return null;
     try {
       state.audioContext = new AudioContext();
+      state.soundMasterGain = state.audioContext.createGain();
+      state.soundCompressor = state.audioContext.createDynamicsCompressor();
+      state.soundMasterGain.gain.setValueAtTime(0.12, state.audioContext.currentTime);
+      state.soundCompressor.threshold.setValueAtTime(-18, state.audioContext.currentTime);
+      state.soundCompressor.knee.setValueAtTime(24, state.audioContext.currentTime);
+      state.soundCompressor.ratio.setValueAtTime(4, state.audioContext.currentTime);
+      state.soundCompressor.attack.setValueAtTime(0.003, state.audioContext.currentTime);
+      state.soundCompressor.release.setValueAtTime(0.18, state.audioContext.currentTime);
+      state.soundMasterGain.connect(state.soundCompressor);
+      state.soundCompressor.connect(state.audioContext.destination);
       return state.audioContext;
     } catch (_) {
       state.audioContext = null;
+      state.soundMasterGain = null;
+      state.soundCompressor = null;
       return null;
     }
   }
 
+  function stopActiveVoices() {
+    const context = state.audioContext;
+    const now = context && context.state !== 'closed' ? context.currentTime : 0;
+    state.activeVoices.forEach((voice) => {
+      try {
+        if (context && context.state !== 'closed') {
+          voice.gain.gain.cancelScheduledValues(now);
+          voice.gain.gain.setTargetAtTime(0.0001, now, 0.008);
+          voice.oscillator.stop(Math.max(now + 0.035, voice.start + 0.035));
+        } else {
+          voice.oscillator.disconnect();
+          voice.gain.disconnect();
+        }
+      } catch (_) { /* an already-ended voice is safe to discard */ }
+    });
+    state.activeVoices.clear();
+  }
+
   function disableSound(message) {
+    stopActiveVoices();
     state.soundEnabled = false;
     state.soundUnlocking = false;
     updateSoundControl();
@@ -119,41 +177,59 @@
       disableSound('Sound unavailable in this browser');
       return;
     }
+    const type = eventType(event).toLowerCase();
+    const profile = type.includes('exception') || type.includes('error') || type.includes('stderr') || type.includes('throw')
+      ? { notes: [{ frequency: 220, offset: 0 }, { frequency: 165, offset: 0.09 }, { frequency: 130, offset: 0.18 }], waveform: 'triangle', duration: 0.31 }
+      : type.includes('stdout') || type.includes('output') || type.includes('log')
+        ? { notes: [{ frequency: 660, offset: 0 }, { frequency: 880, offset: 0.085 }], waveform: 'sine', duration: 0.22 }
+        : type.includes('call')
+          ? { notes: [{ frequency: 440, offset: 0 }, { frequency: 660, offset: 0.09 }], waveform: 'triangle', duration: 0.23 }
+          : type.includes('return')
+            ? { notes: [{ frequency: 550, offset: 0 }, { frequency: 330, offset: 0.1 }], waveform: 'triangle', duration: 0.24 }
+            : { notes: [{ frequency: 350, offset: 0 }, { frequency: 440, offset: 0.085 }], waveform: 'sine', duration: 0.22 };
+
+    const emit = () => {
+      if (!state.soundEnabled || context.state === 'closed') return;
+      try {
+        if (!state.soundMasterGain || !state.soundCompressor) ensureAudioContext();
+        const now = context.currentTime;
+        stopActiveVoices();
+        profile.notes.forEach((note, index) => {
+          const oscillator = context.createOscillator();
+          const gain = context.createGain();
+          const start = now + note.offset;
+          const end = now + profile.duration;
+          const level = index === 0 ? 0.24 : 0.18;
+          oscillator.type = profile.waveform;
+          oscillator.frequency.setValueAtTime(note.frequency, start);
+          oscillator.frequency.exponentialRampToValueAtTime(note.frequency * 0.985, end);
+          gain.gain.setValueAtTime(0.0001, start);
+          gain.gain.exponentialRampToValueAtTime(level, start + 0.014);
+          gain.gain.setValueAtTime(level, Math.max(start + 0.016, end - 0.045));
+          gain.gain.exponentialRampToValueAtTime(0.0001, end);
+          oscillator.connect(gain);
+          gain.connect(state.soundMasterGain);
+          const voice = { oscillator, gain, start };
+          state.activeVoices.add(voice);
+          oscillator.start(start);
+          oscillator.stop(end + 0.025);
+          oscillator.addEventListener('ended', () => {
+            state.activeVoices.delete(voice);
+            oscillator.disconnect();
+            gain.disconnect();
+          }, { once: true });
+        });
+        pulseSoundStatus(event);
+      } catch (_) {
+        disableSound('Sound could not play in this browser');
+      }
+    };
+
     if (context.state === 'suspended') {
-      context.resume().catch(() => disableSound('Sound paused by the browser'));
+      context.resume().then(emit).catch(() => disableSound('Sound paused by the browser'));
       return;
     }
-    const type = eventType(event).toLowerCase();
-    const profile = type.includes('exception') || type.includes('error')
-      ? { frequency: 180, duration: 0.14, waveform: 'sawtooth' }
-      : type.includes('stdout') || type.includes('output')
-        ? { frequency: 660, duration: 0.1, waveform: 'sine' }
-        : type.includes('call')
-          ? { frequency: 440, duration: 0.11, waveform: 'triangle' }
-          : type.includes('return')
-            ? { frequency: 275, duration: 0.11, waveform: 'triangle' }
-            : { frequency: 350, duration: 0.09, waveform: 'sine' };
-    try {
-      const now = context.currentTime;
-      const oscillator = context.createOscillator();
-      const gain = context.createGain();
-      oscillator.type = profile.waveform;
-      oscillator.frequency.setValueAtTime(profile.frequency, now);
-      oscillator.frequency.linearRampToValueAtTime(profile.frequency * 0.98, now + profile.duration);
-      gain.gain.setValueAtTime(0.0001, now);
-      gain.gain.exponentialRampToValueAtTime(0.035, now + 0.012);
-      gain.gain.exponentialRampToValueAtTime(0.0001, now + profile.duration);
-      oscillator.connect(gain);
-      gain.connect(context.destination);
-      oscillator.start(now);
-      oscillator.stop(now + profile.duration + 0.01);
-      oscillator.addEventListener('ended', () => {
-        oscillator.disconnect();
-        gain.disconnect();
-      }, { once: true });
-    } catch (_) {
-      disableSound('Sound could not play in this browser');
-    }
+    emit();
   }
 
   function updateLineNumbers() {
@@ -322,17 +398,34 @@
   }
 
   function eventLabel(event, index) {
-    const line = event && Number.isInteger(Number(event.line)) ? `Line ${event.line}` : `Step ${index + 1}`;
+    const lineNumber = eventLine(event);
+    const line = Number.isInteger(lineNumber) ? `Line ${lineNumber}` : `Step ${index + 1}`;
     const type = eventType(event);
     return { line, type };
   }
 
   function eventType(event) {
-    return String(event && (event.type || event.event || 'unknown')).replace(/[-_]/g, ' ').trim() || 'unknown';
+    const rawValue = String(event && typeof event === 'object' ? (event.type || event.event || event.kind || '') : '');
+    const method = String(event && typeof event === 'object' ? (event.method || event.operation || '') : '').trim().toLowerCase();
+    const raw = rawValue.replace(/[._-]/g, ' ').trim().toLowerCase();
+    if (!raw) return 'unknown';
+    if (raw === 'console' && (method === 'log' || method === 'info')) return 'stdout';
+    if (raw === 'console' && (method === 'warn' || method === 'error')) return 'stderr';
+    if (raw === 'console log' || raw === 'console info' || raw === 'log' || raw === 'info') return 'stdout';
+    if (raw === 'console warn' || raw === 'console error' || raw === 'stderr' || raw === 'warning') return 'stderr';
+    if (raw === 'throw' || raw === 'thrown' || raw === 'uncaught') return 'exception';
+    if (raw === 'step' || raw === 'statement' || raw === 'execution') return 'line';
+    return raw;
+  }
+
+  function eventLine(event) {
+    const value = event && typeof event === 'object' ? (event.line ?? event.lineNumber ?? event.lineno ?? event.location?.line) : undefined;
+    const line = Number(value);
+    return Number.isInteger(line) && line > 0 ? line : null;
   }
 
   function eventVariables(event) {
-    const values = event && (event.variables || event.locals || event.environment);
+    const values = event && (event.variables || event.locals || event.environment || event.vars || event.state);
     return values && typeof values === 'object' && !Array.isArray(values) ? values : {};
   }
 
@@ -348,7 +441,7 @@
   }
 
   function sourceLineForEvent(event) {
-    const line = Number(event && event.line);
+    const line = eventLine(event);
     const source = state.executedSource || ($('code-editor') && $('code-editor').value) || '';
     if (Number.isInteger(line) && line > 0) {
       const sourceLines = source.split('\n');
@@ -375,17 +468,24 @@
   function eventExplanation(event, changes) {
     const type = eventType(event).toLowerCase();
     const functionName = event && (event.function || event.name);
-    const line = Number(event && event.line);
+    const line = eventLine(event);
     const location = Number.isInteger(line) ? ` on line ${line}` : '';
     if (type === 'call') return `Entered ${functionName ? `function ${functionName}` : 'a function'}${location}.`;
     if (type === 'return') {
       const returned = event && (event.return_value ?? event.returnValue ?? event.value);
       return returned === undefined ? `Returned from ${functionName ? `function ${functionName}` : 'the current function'}${location}. The returned value is unknown because the event did not include it.` : `Returned ${valueText(returned)} from ${functionName ? `function ${functionName}` : 'the current function'}${location}.`;
     }
-    if (type === 'exception' || type === 'error') return `An exception occurred${location}${event && event.exception ? `: ${event.exception}` : '.'}`;
+    if (type === 'exception' || type === 'error') {
+      const detail = event && (event.exception ?? event.error ?? event.message);
+      return `An exception occurred${location}${detail ? `: ${detail}` : '.'}`;
+    }
     if (type === 'stdout' || type === 'output') {
       const output = event && (event.output ?? event.value ?? event.text);
       return output === undefined ? `The program wrote output${location}; the event did not include its text.` : `The program wrote ${valueText(output)}${location}.`;
+    }
+    if (type === 'stderr') {
+      const output = event && (event.output ?? event.value ?? event.text ?? event.error);
+      return output === undefined ? `The program wrote an error stream event${location}; its text is unknown.` : `The program wrote ${valueText(output)} to the error stream${location}.`;
     }
     if (type === 'line') {
       if (changes.length) return `Executed the source line${location}; ${changes.map((change) => change.removed ? `${change.name} was removed` : `${change.name} changed to ${valueText(change.after)}`).join(', ')}.`;
@@ -395,7 +495,12 @@
   }
 
   function renderTrace(result, source) {
-    const events = Array.isArray(result && (result.events || result.trace)) ? (result.events || result.trace) : [];
+    stopPlayback();
+    const returnedEvents = Array.isArray(result && result.events) && result.events.length
+      ? result.events
+      : Array.isArray(result && result.trace) ? result.trace
+        : Array.isArray(result && result.events) ? result.events : [];
+    const events = returnedEvents.map((event) => event && typeof event === 'object' ? event : { type: 'unknown', value: event });
     state.trace = events;
     state.lastResult = result || null;
     state.executedSource = typeof source === 'string' ? source : state.executedSource;
@@ -403,10 +508,12 @@
     if (flow && events.length) {
       flow.innerHTML = `<div class="flow-line"></div>${events.map((event, index) => {
         const label = eventLabel(event, index);
-        return `<button class="flow-step${index === 0 ? ' active' : ''}" data-step="${index}" aria-label="Trace step ${index + 1}, ${escapeHtml(label.type)}"><b>${String(index + 1).padStart(2, '0')}</b><span>${escapeHtml(label.line)}</span><small>${escapeHtml(label.type)}</small></button>`;
+        return `<button class="flow-step${index === 0 ? ' active' : ''}" data-step="${index}" data-event-type="${escapeHtml(label.type)}" aria-label="Trace step ${index + 1}, ${escapeHtml(label.type)}"><b>${String(index + 1).padStart(2, '0')}</b><span>${escapeHtml(label.line)}</span><small>${escapeHtml(label.type)}</small></button>`;
       }).join('')}`;
+      flow.dataset.totalSteps = String(events.length);
     } else if (flow) {
       flow.innerHTML = '<div class="flow-empty">No execution events returned. Behavior is unknown for this run.</div>';
+      flow.dataset.totalSteps = '0';
     }
     state.step = events.length ? 0 : 0;
     updateTimeline();
@@ -419,6 +526,8 @@
       updateLineNumbers();
       setText('event-title', 'No event selected');
       setText('event-type', 'Unknown');
+      const emptyEventTypeBadge = $('event-type');
+      if (emptyEventTypeBadge) emptyEventTypeBadge.dataset.eventType = 'unknown';
       setText('event-meta', state.trace.length ? 'Unknown event selection.' : 'No events were returned by the execution service.');
       setText('event-source', 'Unknown source');
       setText('event-explanation', 'Unknown behavior — no execution event is selected.');
@@ -430,7 +539,7 @@
     }
     const changes = changedVariables(state.step);
     const type = eventType(event);
-    const line = Number(event.line);
+    const line = eventLine(event);
     if (Number.isInteger(line) && line > 0) focusSourceLine(line);
     else {
       state.activeLine = null;
@@ -438,6 +547,8 @@
     }
     setText('event-title', Number.isInteger(line) ? `Step ${state.step + 1} · line ${line}` : `Step ${state.step + 1}`);
     setText('event-type', type);
+    const eventTypeBadge = $('event-type');
+    if (eventTypeBadge) eventTypeBadge.dataset.eventType = type;
     setText('event-meta', `Sequence ${event.sequence ?? state.step} · ${type}${Number.isInteger(line) ? ` · line ${line}` : ''}`);
     setText('event-source', sourceLineForEvent(event) || 'Unknown source line');
     setText('event-explanation', eventExplanation(event, changes));
@@ -445,7 +556,39 @@
     renderChangedVariables(changes);
     renderStack(event.call_stack || event.stack);
     renderEventOutput(event);
-    if (event.line) setText('run-status', `Viewing line ${event.line} · ${type}`);
+    if (line) setText('run-status', `Viewing line ${line} · ${type}`);
+    animateSelectedStep();
+  }
+
+  function animateSelectedStep() {
+    const token = ++state.animationToken;
+    if (state.animationFrame) window.cancelAnimationFrame(state.animationFrame);
+    const elements = [
+      document.querySelector('.trace-panel'),
+      $('event-title'),
+      $('event-type'),
+      $('event-source'),
+      $('event-explanation'),
+      $('variables-list'),
+      $('changed-variables'),
+      $('stack-list'),
+      $('event-output')
+    ].filter(Boolean);
+    elements.push(...all('.flow-step.active'), ...all('#line-numbers span.active'), ...all('#variables-list .data-row'), ...all('#changed-variables .data-row'), ...all('#stack-list .stack-row'), ...all('#event-output .console-line'));
+    elements.forEach((element) => element.classList.remove('step-animate'));
+    state.animationFrame = window.requestAnimationFrame(() => {
+      if (token !== state.animationToken) return;
+      elements.forEach((element) => element.classList.add('step-animate'));
+      window.setTimeout(() => {
+        if (token !== state.animationToken) return;
+        elements.forEach((element) => element.classList.remove('step-animate'));
+      }, 520);
+    });
+    const panel = document.querySelector('.trace-panel');
+    if (panel) {
+      panel.dataset.activeStep = state.trace.length ? String(state.step) : '';
+      panel.dataset.eventType = state.trace.length ? eventType(state.trace[state.step]) : 'unknown';
+    }
   }
 
   function renderChangedVariables(changes) {
@@ -472,7 +615,7 @@
     const output = $('event-output');
     const status = $('event-output-status');
     if (!output) return;
-    const values = event && (event.output ?? event.outputs ?? event.stdout);
+    const values = event && (event.output ?? event.outputs ?? event.stdout ?? (eventType(event) === 'stderr' ? event.stderr : undefined));
     const lines = Array.isArray(values) ? values : values === undefined || values === null ? [] : String(values).split('\n').filter(Boolean);
     if (status) status.textContent = lines.length ? 'Recorded' : 'Unknown';
     output.innerHTML = lines.length ? lines.map((line) => `<div class="console-line"><span>›</span><span>${escapeHtml(line)}</span></div>`).join('') : '<div class="console-line muted-line"><span>›</span><span>No output recorded for this event.</span></div>';
@@ -538,6 +681,15 @@
   async function callApi(endpoint, payload) {
     try {
       const response = await fetch(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+      if (!response.ok && response.status >= 400 && response.status < 500) {
+        // The server answered and rejected the request (for example "code too large"): show
+        // its reason instead of pretending the API is offline and running the offline subset.
+        let detail = `HTTP ${response.status}`;
+        try { const body = await response.json(); if (body && body.error) detail = String(body.error); } catch (_) { /* keep the status text */ }
+        setApiStatus(true);
+        const rejected = { title: 'Request rejected', detail };
+        return { status: 'error', valid: false, error: detail, message: detail, errors: [rejected], diagnostics: [rejected], output: [], variables: {}, events: [], call_stack: [] };
+      }
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       setApiStatus(true);
       return await response.json();
@@ -562,6 +714,11 @@
       const passed = result.status === 'completed' && diagnostics.length === 0;
       renderDiagnostics(diagnostics, passed);
       setText('run-status', passed ? 'Execution complete' : `Execution stopped · ${result.status || 'issues found'}`);
+      if (result.limits && result.limits.events_truncated) {
+        const shown = Array.isArray(state.trace) ? state.trace.length : 0;
+        setText('run-status', `${$('run-status') ? $('run-status').textContent : 'Execution complete'} · timeline limited to the first ${shown} steps`);
+        showToast(`Long run: the timeline shows only the first ${shown} steps (the program itself ran to the end).`);
+      }
     } else if (state.language === 'python') {
       const fallback = offlinePython(source);
       renderConsole(fallback.output, true);
@@ -637,17 +794,30 @@
       renderSelectedEvent();
       return;
     }
-    steps.forEach((step, index) => step.classList.toggle('active', index === state.step));
+    steps.forEach((step, index) => {
+      const active = index === state.step;
+      step.classList.toggle('active', active);
+      step.setAttribute('aria-current', active ? 'step' : 'false');
+    });
     const progress = state.step / (steps.length - 1 || 1) * 100;
     const bar = $('timeline-progress');
     const thumb = $('timeline-thumb');
     if (bar) bar.style.width = `${progress}%`;
     if (thumb) thumb.style.left = `${progress}%`;
     setText('step-count', `${state.step + 1} / ${steps.length}`);
+    const stepCount = $('step-count');
+    if (stepCount) {
+      stepCount.dataset.activeStep = String(state.step + 1);
+      stepCount.dataset.totalSteps = String(steps.length);
+      stepCount.setAttribute('aria-label', `Step ${state.step + 1} of ${steps.length}`);
+    }
+    const flow = $('flow-map');
+    if (flow) flow.dataset.activeStep = String(state.step);
     renderSelectedEvent();
   }
 
-  function selectTimelineStep(step, playSound = false) {
+  function selectTimelineStep(step, playSound = false, source = 'manual') {
+    if (source !== 'playback') stopPlayback();
     const length = all('.flow-step').length;
     if (!length) return;
     const nextStep = Math.max(0, Math.min(length - 1, step));
@@ -657,11 +827,25 @@
     if (playSound && (changed || state.trace[state.step])) playStepSound(state.trace[state.step]);
   }
 
-  function moveTimeline(delta) {
+  function moveTimeline(delta, source = 'manual') {
     const length = all('.flow-step').length;
     if (!length) return;
-    selectTimelineStep(state.step + delta, true);
+    selectTimelineStep(state.step + delta, true, source);
     setText('run-status', `Viewing step ${state.step + 1}`);
+  }
+
+  function stopPlayback(status) {
+    state.playing = false;
+    state.playbackToken += 1;
+    window.clearInterval(state.timer);
+    state.timer = null;
+    const button = $('play-button');
+    if (button) {
+      button.textContent = '▶';
+      button.setAttribute('aria-label', 'Play timeline');
+      button.classList.remove('is-playing');
+    }
+    if (status) setText('run-status', status);
   }
 
   function togglePlayback() {
@@ -669,16 +853,28 @@
       showToast('No execution events are available to play.');
       return;
     }
-    state.playing = !state.playing;
-    const button = $('play-button');
-    if (button) button.textContent = state.playing ? 'Ⅱ' : '▶';
-    window.clearInterval(state.timer);
     if (state.playing) {
-      state.timer = window.setInterval(() => {
-        if (state.step >= all('.flow-step').length - 1) { state.step = -1; }
-        moveTimeline(1);
-      }, 1200);
+      stopPlayback('Playback paused');
+      return;
     }
+    if (state.step >= all('.flow-step').length - 1) selectTimelineStep(0, false);
+    state.playing = true;
+    const token = ++state.playbackToken;
+    const button = $('play-button');
+    if (button) {
+      button.textContent = 'Ⅱ';
+      button.setAttribute('aria-label', 'Pause timeline');
+      button.classList.add('is-playing');
+    }
+    state.timer = window.setInterval(() => {
+      if (!state.playing || token !== state.playbackToken) return;
+      const length = all('.flow-step').length;
+      if (!length || state.step >= length - 1) {
+        stopPlayback('Playback complete');
+        return;
+      }
+      moveTimeline(1, 'playback');
+    }, 720);
   }
 
   function importCode(file) {

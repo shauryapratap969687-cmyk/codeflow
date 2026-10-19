@@ -77,6 +77,22 @@ The backend serves the local frontend and exposes:
 
 Python programs run in a bounded child process with captured stdout/stderr, syntax/runtime locations, normalized trace events, variable snapshots, call-stack snapshots, source/output/event limits, and a hard timeout. JavaScript runs in Node.js when it is on `PATH`; otherwise the API returns an explicit unsupported response. The AI endpoint returns `status: "not-configured"` and no answer when `CODEFLOW_AI_API_KEY` is absent. With the variables below, it sends the current code, language, diagnostics, selected trace event, and user prompt to an OpenAI-compatible chat-completions endpoint. The provider must return a JSON object in `message.content` with a non-empty `answer` and may include a bounded `proposed_code` object.
 
+### Deployment hardening
+
+- User programs run in short-lived workers with bounded time, output, trace,
+  result size, concurrency, and (where the host supports it) memory limits.
+- Python workers receive a minimal environment and do not receive the AI key;
+  process, socket, `/proc`, and out-of-directory writes are blocked by the
+  worker audit guard. JavaScript runs in a restricted VM with no host
+  `process`/`require` access and bounded virtual timers.
+- Public requests have in-memory per-client run/AI rate limits and an AI daily
+  budget. Tune them with `CODEFLOW_MAX_CONCURRENT`, `CODEFLOW_RATE_EXECUTE`,
+  `CODEFLOW_RATE_AI`, and `CODEFLOW_AI_DAILY_LIMIT`.
+- Static HTTP serving is allowlisted to the four frontend files. Backend
+  source, `.env`, `render.yaml`, tests, and `.git` files are not served.
+- A 4xx API response is shown as a request/diagnostic error in the UI instead
+  of being misreported as offline mode.
+
 ### Configure remote AI
 
 Set the key before starting `backend.py`. `CODEFLOW_AI_BASE_URL` is optional and defaults to `https://api.openai.com/v1`; it may also be a complete `/chat/completions` URL. `CODEFLOW_AI_MODEL` is optional and defaults to `gpt-4o-mini`.
@@ -119,4 +135,4 @@ node smoke-test.js
 python -m unittest discover -s tests -v
 ```
 
-The JavaScript smoke test is dependency-free and checks the static entry point. The Python tests exercise execution, limits/diagnostics, verification, JavaScript capability handling, missing AI credentials, and a mocked structured provider response with a proposed code change.
+The JavaScript smoke test is dependency-free and checks the static entry point. The Python tests exercise execution, limits/diagnostics, verification, JavaScript capability handling, missing AI credentials, a mocked structured provider response with a proposed code change, sandbox boundaries, rate limits, result-size robustness, and static-file exposure. The hardening suite is in `tests/test_hardening.py`.

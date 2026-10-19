@@ -120,3 +120,67 @@ a { text-decoration: none; }
 body.light { --bg: #f5f7fb; --surface: #fff; --surface-2: #eef1f8; --surface-3: #e4e8f2; --border: #d4d9e6; --border-soft: rgba(20, 27, 48, .1); --text: #1c2233; --muted: #5e6880; --subtle: #8992a6; background: #f5f7fb; }.light .topbar { background: rgba(245, 247, 251, .9); }.light .glass-card, .light .panel { background: rgba(255, 255, 255, .92); }.light .editor-wrap { background: #f6f8fc; }.light #code-editor { color: #27324b; }.light .line-numbers span.active { background: #9e7bff1c; }
 
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; animation-duration: .01ms !important; } }
+
+/* Trace navigation feedback stays brief and local to the changed surfaces. */
+.timeline-progress, .timeline-thumb { transition: width .3s ease, left .3s ease; }
+.flow-step, .line-numbers span, .trace-panel, #event-title, #event-type, #event-source, #event-explanation,
+#variables-list, #changed-variables, #stack-list, #event-output, .data-row, .stack-row, .console-line {
+  will-change: transform, opacity;
+}
+.flow-step.step-animate, .line-numbers span.step-animate, .trace-panel.step-animate,
+#event-title.step-animate, #event-type.step-animate, #event-source.step-animate, #event-explanation.step-animate,
+#variables-list.step-animate, #changed-variables.step-animate, #stack-list.step-animate, #event-output.step-animate,
+.data-row.step-animate, .stack-row.step-animate, .console-line.step-animate {
+  animation: codeflow-step-focus .42s cubic-bezier(.22, .8, .35, 1) both;
+}
+.flow-step.active { box-shadow: 0 0 0 1px rgba(158, 123, 255, .08), 0 6px 18px rgba(111, 78, 232, .12); }
+.flow-step[data-event-type="unknown"] small, .trace-badge[data-event-type="unknown"] { color: var(--muted); }
+.step-animate .data-row, .step-animate .stack-row, .step-animate .console-line { animation: codeflow-step-row .36s ease both; }
+.sound-button.sound-fired, #sound-status.sound-fired { animation: codeflow-sound-pulse .42s ease both; }
+#sound-status { display: inline-flex; align-items: center; min-width: 0; color: var(--subtle); font-size: 9px; }
+#sound-status.sound-fired { color: var(--cyan); }
+#step-count { min-width: 42px; color: var(--text); font: 10px var(--mono); text-align: center; }
+#step-count::before { content: 'step '; color: var(--subtle); font-family: inherit; }
+
+@keyframes codeflow-step-focus {
+  0% { opacity: .55; transform: translateY(2px); }
+  100% { opacity: 1; transform: translateY(0); }
+}
+@keyframes codeflow-step-row {
+  0% { opacity: .6; transform: translateX(3px); }
+  100% { opacity: 1; transform: translateX(0); }
+}
+@keyframes codeflow-sound-pulse {
+  0% { box-shadow: 0 0 0 0 rgba(97, 217, 211, .35); }
+  100% { box-shadow: 0 0 0 6px rgba(97, 217, 211, 0); }
+}
+
+/* Give the execution drawer room for real traces while keeping output readable. */
+.workspace-drawer {
+  grid-template-columns: minmax(0, 1.1fr) minmax(190px, .75fr) minmax(300px, 1.8fr);
+  grid-template-rows: repeat(2, minmax(0, 1fr));
+  height: 286px;
+}
+.flow-panel { grid-column: 1; grid-row: 1 / span 2; }
+.data-panel { grid-column: 2; grid-row: 1; }
+.diagnostics-panel { grid-column: 2; grid-row: 2; }
+.console-panel {
+  grid-column: 3;
+  grid-row: 1 / span 2;
+  display: grid;
+  grid-template-columns: minmax(0, 1.55fr) minmax(150px, .8fr);
+  grid-template-rows: auto minmax(0, 1fr);
+}
+.console-panel > .panel-header { grid-column: 1 / -1; }
+.console-panel > .console-output { grid-column: 1; grid-row: 2; min-height: 0; }
+.event-output-inline {
+  grid-column: 2;
+  grid-row: 2;
+  min-width: 0;
+  margin: 0;
+  padding: 0 10px 7px;
+  border-top: 0;
+  border-left: 1px solid var(--border);
+}
+.inline-heading { gap: 7px; }
+.event-output-inline .console-output { height: calc(100% - 24px); max-height: none; padding: 3px 0 0; }
