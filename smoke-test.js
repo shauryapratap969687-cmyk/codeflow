@@ -25,7 +25,9 @@ const checks = [
   ['teacher mode controls', html.includes('id="teacher-simple"') && html.includes('id="teacher-detailed"')],
   ['value journey evidence', html.includes('id="value-journey"') && js.includes('lineInfoFor') && js.includes('textualSubstitution')],
   ['bilingual narration', js.includes('function narrate') && js.includes('hi-IN') && js.includes('प्रोग्राम')],
-  ['speech preferences', js.includes('voiceschanged') && js.includes('codeflow.teacher.speed')]
+  ['speech preferences', js.includes('voiceschanged') && js.includes('codeflow.teacher.speed')],
+  ['call tree view', html.includes('id="call-tree-view-tab"') && html.includes('id="call-tree-panel"') && js.includes('buildCallTree')],
+  ['call tree accessibility', js.includes('role="button"') && js.includes('call-tree-node') && js.includes('prepareCallTree')]
 ];
 if (/coldchain|cold-chain/i.test(html + js + backend)) throw new Error('Standalone folder contains an unrelated product reference');
 const failed = checks.filter(([, passed]) => !passed);

@@ -474,6 +474,151 @@
     return '';
   }
 
+  function callFrameName(frame) {
+    if (typeof frame === 'string') return frame;
+    if (frame && typeof frame === 'object') return String(frame.function || frame.name || frame.label || 'Unknown');
+    return 'Unknown';
+  }
+
+  function callArgumentsText(event) {
+    const variables = eventVariables(event);
+    return Object.entries(variables).map(([name, value]) => `${name}=${valueText(value)}`).join(', ');
+  }
+
+  function buildCallTree(events) {
+    const nodes = [];
+    const roots = [];
+    const active = [];
+    const stepNodeIds = Array.isArray(events) ? events.map(() => null) : [];
+    const repeatGroups = new Map();
+    (Array.isArray(events) ? events : []).forEach((event, sequence) => {
+      if (!event || typeof event !== 'object') return;
+      const type = String(event.type || event.event || '').toLowerCase();
+      const stack = Array.isArray(event.call_stack || event.stack) ? (event.call_stack || event.stack) : [];
+      const depth = stack.length ? Math.max(0, stack.length - 1) : Math.max(0, active.length - (type === 'return' ? 1 : 0));
+      if (type === 'call') {
+        const functionName = String(event.function || callFrameName(stack[depth]) || 'Unknown');
+        const argumentsText = callArgumentsText(event);
+        const parent = depth > 0 ? (active[depth - 1] || null) : null;
+        const node = {
+          id: `call-${nodes.length}`,
+          functionName,
+          argumentsText,
+          label: argumentsText ? `${functionName}(${argumentsText})` : functionName,
+          parentId: parent ? parent.id : null,
+          children: [],
+          depth,
+          callSequence: sequence,
+          returnSequence: null,
+          returnValue: undefined,
+          hasReturnValue: false,
+          repeatCount: 1
+        };
+        if (parent) parent.children.push(node);
+        else roots.push(node);
+        nodes.push(node);
+        active.length = depth;
+        active[depth] = node;
+        const repeatKey = `${functionName}\u0000${argumentsText}`;
+        const group = repeatGroups.get(repeatKey) || [];
+        group.push(node);
+        repeatGroups.set(repeatKey, group);
+        node.repeatKey = repeatKey;
+        stepNodeIds[sequence] = node.id;
+        return;
+      }
+      const current = active[depth] || active[active.length - 1];
+      if (current) stepNodeIds[sequence] = current.id;
+      if (type === 'return' && current) {
+        current.returnSequence = sequence;
+        if (Object.prototype.hasOwnProperty.call(event, 'return_value')) {
+          current.returnValue = event.return_value;
+          current.hasReturnValue = true;
+        }
+      }
+    });
+    repeatGroups.forEach((group) => group.forEach((node) => { node.repeatCount = group.length; }));
+    return {
+      nodes,
+      roots,
+      stepNodeIds,
+      repeatGroups: Array.from(repeatGroups.values()).filter((group) => group.length > 1),
+      hasFunctionCall: nodes.some((node) => node.functionName !== '<module>')
+    };
+  }
+
+  function callTreeDescendantCount(node) {
+    return (node.children || []).reduce((total, child) => total + 1 + callTreeDescendantCount(child), 0);
+  }
+
+  function prepareCallTree(tree, maxVisible = 200) {
+    if (!tree || !Array.isArray(tree.nodes)) return { nodes: [], edges: [], omittedCount: 0 };
+    const realLimit = Math.max(1, maxVisible - 1);
+    const visibleReal = tree.nodes.slice(0, realLimit);
+    const visibleIds = new Set(visibleReal.map((node) => node.id));
+    const nodes = visibleReal.map((node) => ({ ...node, children: (node.children || []).filter((child) => visibleIds.has(child.id)) }));
+    const edges = nodes.filter((node) => node.parentId && visibleIds.has(node.parentId)).map((node) => ({ parentId: node.parentId, childId: node.id }));
+    const omittedCount = Math.max(0, tree.nodes.length - visibleReal.length);
+    if (omittedCount) {
+      const firstOmitted = tree.nodes[visibleReal.length];
+      const anchor = nodes.find((node) => node.id === firstOmitted.parentId) || nodes.find((node) => !node.parentId) || nodes[0];
+      if (anchor) {
+        const collapsed = {
+          id: `collapsed-${anchor.id}`,
+          functionName: `+${omittedCount} more`,
+          argumentsText: 'deeper calls collapsed',
+          label: `+${omittedCount} more`,
+          parentId: anchor.id,
+          children: [],
+          depth: anchor.depth + 1,
+          callSequence: firstOmitted.callSequence,
+          returnSequence: null,
+          returnValue: undefined,
+          hasReturnValue: false,
+          repeatCount: 1,
+          collapsed: true,
+          omittedCount
+        };
+        nodes.push(collapsed);
+        edges.push({ parentId: anchor.id, childId: collapsed.id });
+      }
+    }
+    return { nodes, edges, omittedCount, visibleIds, collapsed: omittedCount > 0 };
+  }
+
+  function layoutCallTree(prepared, options = {}) {
+    const nodes = Array.isArray(prepared && prepared.nodes) ? prepared.nodes : [];
+    const columnGap = Number(options.columnGap) || 190;
+    const rowGap = Number(options.rowGap) || 84;
+    const levels = new Map();
+    nodes.forEach((node) => {
+      const level = levels.get(node.depth) || [];
+      level.push(node);
+      levels.set(node.depth, level);
+    });
+    let maxColumns = 1;
+    let maxDepth = 0;
+    levels.forEach((level, depth) => {
+      level.sort((a, b) => a.callSequence - b.callSequence);
+      maxColumns = Math.max(maxColumns, level.length);
+      maxDepth = Math.max(maxDepth, depth);
+    });
+    const positions = new Map();
+    levels.forEach((level, depth) => level.forEach((node, index) => positions.set(node.id, {
+      x: 20 + index * columnGap,
+      y: 18 + depth * rowGap,
+      width: 174,
+      height: 56
+    })));
+    return {
+      nodes,
+      edges: Array.isArray(prepared && prepared.edges) ? prepared.edges : [],
+      positions,
+      width: Math.max(760, maxColumns * columnGap + 30),
+      height: Math.max(110, (maxDepth + 1) * rowGap + 30)
+    };
+  }
+
   function lineInfoFor(event) {
     const direct = event && typeof event === 'object' ? event.line_info : null;
     if (direct && typeof direct === 'object') return direct;
@@ -685,7 +830,61 @@
       flow.dataset.totalSteps = '0';
     }
     state.step = events.length ? 0 : 0;
+    state.callTree = buildCallTree(events);
+    renderCallTree();
     updateTimeline();
+  }
+
+  function renderCallTree() {
+    const canvas = $('call-tree-canvas');
+    const note = $('call-tree-note');
+    if (!canvas) return;
+    const tree = state.callTree || buildCallTree(state.trace);
+    if (!tree.hasFunctionCall) {
+      if (note) note.textContent = 'No user-defined function calls were recorded. The flow view still shows every execution event.';
+      canvas.innerHTML = '<div class="call-tree-empty">No function calls in this run.</div>';
+      return;
+    }
+    const prepared = prepareCallTree(tree, 200);
+    const layout = layoutCallTree(prepared);
+    const byId = new Map(prepared.nodes.map((node) => [node.id, node]));
+    const selectedActualId = tree.stepNodeIds[state.step];
+    let selectedId = selectedActualId;
+    if (selectedId && !byId.has(selectedId)) {
+      const actual = tree.nodes.find((node) => node.id === selectedId);
+      const collapsed = actual && prepared.nodes.find((node) => node.collapsed && node.parentId === actual.parentId);
+      selectedId = collapsed ? collapsed.id : null;
+    }
+    const truncated = Boolean(state.lastResult && state.lastResult.limits && state.lastResult.limits.events_truncated);
+    const notes = [];
+    if (tree.repeatGroups.length) {
+      const repeated = tree.repeatGroups[0][0];
+      notes.push(`${escapeHtml(repeated.label)} called ${repeated.repeatCount} times with the same arguments; caching or memoization would avoid those repeats.`);
+    }
+    if (prepared.omittedCount) notes.push(`Showing ${prepared.nodes.length - 1} call nodes; +${prepared.omittedCount} deeper calls are collapsed.`);
+    if (truncated) notes.push('The execution trace was truncated, so this tree contains only the recorded calls.');
+    if (note) note.innerHTML = notes.length ? notes.join(' ') : 'Select a node or move through the timeline to follow the active call.';
+    const edgeMarkup = layout.edges.map((edge) => {
+      const parent = layout.positions.get(edge.parentId);
+      const child = layout.positions.get(edge.childId);
+      const childNode = byId.get(edge.childId);
+      if (!parent || !child || !childNode) return '';
+      const reached = childNode.callSequence <= state.step;
+      const midpoint = (parent.y + parent.height + child.y) / 2;
+      return `<path class="call-tree-edge${reached ? ' reached' : ''}" d="M ${parent.x + parent.width / 2} ${parent.y + parent.height} C ${parent.x + parent.width / 2} ${midpoint}, ${child.x + child.width / 2} ${midpoint}, ${child.x + child.width / 2} ${child.y}" aria-hidden="true"></path>`;
+    }).join('');
+    const nodeMarkup = layout.nodes.map((node) => {
+      const position = layout.positions.get(node.id);
+      if (!position) return '';
+      const reached = node.callSequence <= state.step;
+      const selected = node.id === selectedId;
+      const classes = ['call-tree-node', reached ? 'reached' : 'future', selected ? 'selected' : '', node.collapsed ? 'collapsed' : ''].filter(Boolean).join(' ');
+      const returnText = node.collapsed ? 'Expand by reducing the trace' : node.hasReturnValue ? `return ${valueText(node.returnValue)}` : node.returnSequence === null ? 'return not recorded' : 'return value unknown';
+      const badge = node.repeatCount > 1 && !node.collapsed ? `<text class="call-tree-badge" x="${position.x + position.width - 7}" y="${position.y + 15}" text-anchor="end">×${node.repeatCount}</text>` : '';
+      const aria = node.collapsed ? `${node.label}; ${node.omittedCount} calls collapsed` : `${node.label}; ${returnText}`;
+      return `<g class="${classes}" data-node-id="${escapeHtml(node.id)}" tabindex="0" role="button" aria-label="${escapeHtml(aria)}"><title>${escapeHtml(aria)}</title><rect x="${position.x}" y="${position.y}" width="${position.width}" height="${position.height}" rx="8"></rect><text class="call-tree-function" x="${position.x + 9}" y="${position.y + 19}">${escapeHtml(node.functionName)}</text><text class="call-tree-args" x="${position.x + 9}" y="${position.y + 35}">${escapeHtml(node.collapsed ? node.argumentsText : (node.argumentsText || 'no arguments recorded'))}</text><text class="call-tree-return" x="${position.x + 9}" y="${position.y + 49}">${escapeHtml(returnText)}</text>${badge}</g>`;
+    }).join('');
+    canvas.innerHTML = `<svg class="call-tree-svg" viewBox="0 0 ${layout.width} ${layout.height}" role="img" aria-label="Call tree with ${prepared.nodes.length} visible nodes" focusable="false"><g class="call-tree-edges">${edgeMarkup}</g><g class="call-tree-nodes">${nodeMarkup}</g></svg>`;
   }
 
   function renderTeacherJourney(event) {
@@ -1068,6 +1267,7 @@
       const thumb = $('timeline-thumb');
       if (bar) bar.style.width = '0%';
       if (thumb) thumb.style.left = '0%';
+      renderCallTree();
       renderSelectedEvent();
       return;
     }
@@ -1090,6 +1290,7 @@
     }
     const flow = $('flow-map');
     if (flow) flow.dataset.activeStep = String(state.step);
+    renderCallTree();
     renderSelectedEvent();
   }
 
@@ -1223,6 +1424,19 @@
     if (result && result.message) showToast(result.message);
   }
 
+  function setExecutionView(view) {
+    const showTree = view === 'call-tree';
+    const flow = $('flow-map');
+    const tree = $('call-tree-panel');
+    const flowTab = $('flow-view-tab');
+    const treeTab = $('call-tree-view-tab');
+    if (flow) flow.classList.toggle('hidden', showTree);
+    if (tree) tree.classList.toggle('hidden', !showTree);
+    if (flowTab) { flowTab.classList.toggle('active', !showTree); flowTab.setAttribute('aria-selected', String(!showTree)); }
+    if (treeTab) { treeTab.classList.toggle('active', showTree); treeTab.setAttribute('aria-selected', String(showTree)); }
+    if (showTree) renderCallTree();
+  }
+
   function loadExample(name) {
     const examples = {
       recursion: 'def countdown(n):\n    if n <= 0:\n        return "go!"\n    return countdown(n - 1)\n\nresult = countdown(3)\nprint(result)',
@@ -1264,6 +1478,23 @@
       const step = event.target.closest('.flow-step');
       if (!step) return;
       selectTimelineStep(Number(step.dataset.step) || 0, true);
+    });
+    $('flow-view-tab').addEventListener('click', () => setExecutionView('flow'));
+    $('call-tree-view-tab').addEventListener('click', () => setExecutionView('call-tree'));
+    $('call-tree-canvas').addEventListener('click', (event) => {
+      const nodeElement = event.target.closest('.call-tree-node');
+      if (!nodeElement) return;
+      const node = (state.callTree && state.callTree.nodes || []).find((item) => item.id === nodeElement.dataset.nodeId);
+      if (!node) return;
+      if (node.collapsed) { showToast('This subtree is collapsed because the visible call-tree limit was reached.'); return; }
+      selectTimelineStep(node.callSequence, true);
+    });
+    $('call-tree-canvas').addEventListener('keydown', (event) => {
+      if (event.key !== 'Enter' && event.key !== ' ') return;
+      const nodeElement = event.target.closest('.call-tree-node');
+      if (!nodeElement) return;
+      event.preventDefault();
+      nodeElement.click();
     });
     $('diagnostics-output').addEventListener('click', (event) => {
       const item = event.target.closest('[data-line]');
@@ -1326,6 +1557,12 @@
       const source = event && (event.source_line || event.source || '');
       return narrationForLanguage(event, nextEvent, lineInfo, source, language === 'hi' ? 'hi' : 'en', before, after);
     }
+  });
+  window.CodeFlowCallTree = Object.freeze({
+    buildCallTree,
+    prepareCallTree,
+    layoutCallTree,
+    callArgumentsText
   });
 
   function replaceText(allMatches) {
