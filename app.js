@@ -309,6 +309,65 @@
     if (Number.isInteger(firstLine) && firstLine > 0) focusSourceLine(firstLine);
   }
 
+  function renderDebugEvidence(evidence) {
+    const container = $('debug-evidence');
+    const status = $('debug-status');
+    const summary = $('debug-summary');
+    if (!container || !summary) return;
+    if (!evidence) {
+      if (status) status.textContent = 'Not checked';
+      summary.textContent = 'Run the program, paste expected output, and compare the recorded result.';
+      container.innerHTML = '';
+      return;
+    }
+    const comparison = evidence.comparison;
+    if (status) status.textContent = comparison.matches ? 'Matches' : 'Mismatch';
+    summary.textContent = debugSummary(evidence);
+    const selectedLine = eventLine(evidence.selectedEvent);
+    const variableRows = evidence.reads.length ? evidence.reads.map((item) => {
+      const change = item.lastChange;
+      const value = item.value === undefined ? 'Unknown' : valueText(item.value);
+      const jump = change && change.eventIndex !== undefined ? `<button class="button button-ghost small-button debug-jump" type="button" data-step="${Number(change.eventIndex)}">This value was set${change.line ? ` on line ${Number(change.line)}` : ''}, step ${Number(change.sequence) + 1}</button>` : '<span class="debug-unknown">last change unknown</span>';
+      return `<div class="debug-variable"><code>${escapeHtml(item.name)}</code><span>${escapeHtml(value)}</span>${jump}</div>`;
+    }).join('') : '<div class="debug-unknown">No recorded read variables were available for the mismatching output event.</div>';
+    const mismatch = comparison.firstMismatch >= 0 ? `<div class="debug-output-pair"><span>Actual: <code>${escapeHtml(comparison.actualText || '∅')}</code></span><span>Expected: <code>${escapeHtml(comparison.expectedText || '∅')}</code></span></div>` : '';
+    const context = selectedLine ? `<div class="debug-context">Mapped to recorded step ${Number(evidence.selectedIndex) + 1} on line ${Number(selectedLine)}.</div>` : '<div class="debug-context">No exact trace step could be mapped to this output line.</div>';
+    const truncation = evidence.truncated ? '<div class="debug-context">Some output or trace data was truncated; only recorded evidence is shown.</div>' : '';
+    container.innerHTML = `${mismatch}${context}${truncation}<div class="debug-read-heading">Values read by that line</div>${variableRows}`;
+  }
+
+  function compareExpectedOutput() {
+    const expectedInput = $('expected-output');
+    if (!expectedInput) return;
+    const result = state.lastResult;
+    if (!result) { renderDebugEvidence(null); showToast('Run the program before comparing output.'); return; }
+    const evidence = debugEvidence(result, expectedInput.value);
+    state.debugEvidence = evidence;
+    renderDebugEvidence(evidence);
+  }
+
+  async function askDebugHint() {
+    const evidence = state.debugEvidence;
+    if (!evidence) { showToast('Compare expected output first.'); return; }
+    const payload = {
+      ...aiContext('Give a hint about the output mismatch using only the supplied evidence. Do not invent values.'),
+      mode: 'debug',
+      debug_evidence: {
+        summary: debugSummary(evidence),
+        comparison: evidence.comparison,
+        reads: evidence.reads,
+        selected_event: evidence.selectedEvent,
+        line_info: evidence.lineInfo
+      }
+    };
+    const result = await callApi('/api/ai', payload);
+    if (result && result.status === 'ok' && typeof (result.answer || result.response) === 'string') {
+      setText('debug-summary', result.answer || result.response);
+      setText('ai-response', result.answer || result.response);
+      setAiProviderStatus('remote', 'Remote AI · debug hint received');
+    } else if (result && result.message) showToast(result.message);
+  }
+
   function setApiStatus(online) {
     state.apiOnline = online;
     const badge = $('api-badge');
@@ -773,6 +832,115 @@
     const cells = comparison.map((cell) => `<span class="structure-cell ${cell.status}" title="${escapeHtml(`${cell.label}: ${cell.status}`)}"><b>${escapeHtml(cell.label)}</b><code>${escapeHtml(valueText(cell.status === 'removed' ? cell.before : cell.after))}</code></span>`).join('');
     const truncation = afterModel.truncated || beforeModel.truncated ? `<span class="structure-more">+${Math.max(afterModel.total || 0, beforeModel.total || 0) - Math.max(afterModel.cells.length, beforeModel.cells.length)} more</span>` : '';
     return `<div class="structure-visual"><div class="structure-heading"><b>${escapeHtml(name)}</b><span>${escapeHtml(kind)}${beforeType && afterType && beforeType !== afterType ? ` · ${escapeHtml(beforeType)} → ${escapeHtml(afterType)}` : ''}</span></div><div class="structure-cells ${escapeHtml(kind)}">${cells || '<span class="journey-unknown">No recorded cells.</span>'}${truncation}</div></div>`;
+  }
+
+  function debugOutputLines(value) {
+    const text = String(value ?? '').replace(/\r\n/g, '\n');
+    if (text === '') return [];
+    const lines = text.split('\n');
+    if (lines.length > 1 && lines[lines.length - 1] === '') lines.pop();
+    return lines;
+  }
+
+  function visibleDebugText(value) {
+    const text = String(value ?? '');
+    return text.replace(/ /g, '·').replace(/\t/g, '→').replace(/\r/g, '␍') || '∅';
+  }
+
+  function compareDebugOutput(expected, actual) {
+    const expectedLines = debugOutputLines(expected);
+    const actualLines = debugOutputLines(actual);
+    const length = Math.max(expectedLines.length, actualLines.length);
+    let firstMismatch = -1;
+    for (let index = 0; index < length; index += 1) {
+      if (expectedLines[index] !== actualLines[index]) { firstMismatch = index; break; }
+    }
+    const whitespaceOnly = firstMismatch >= 0 && expectedLines[firstMismatch] !== undefined && actualLines[firstMismatch] !== undefined && expectedLines[firstMismatch].trim().replace(/\s+/g, ' ') === actualLines[firstMismatch].trim().replace(/\s+/g, ' ');
+    return {
+      matches: firstMismatch < 0,
+      firstMismatch,
+      expectedLines,
+      actualLines,
+      expectedCount: expectedLines.length,
+      actualCount: actualLines.length,
+      countDiffers: expectedLines.length !== actualLines.length,
+      whitespaceOnly,
+      expectedText: firstMismatch >= 0 ? visibleDebugText(expectedLines[firstMismatch]) : '',
+      actualText: firstMismatch >= 0 ? visibleDebugText(actualLines[firstMismatch]) : ''
+    };
+  }
+
+  function outputEventMap(events) {
+    const mapping = [];
+    let lineIndex = 0;
+    let partial = '';
+    (Array.isArray(events) ? events : []).forEach((event, sequence) => {
+      const delta = event && event.output_delta;
+      if (delta === undefined || delta === null || delta === '') return;
+      partial += String(delta).replace(/\r\n/g, '\n');
+      let newline;
+      while ((newline = partial.indexOf('\n')) >= 0) {
+        mapping[lineIndex] = { eventIndex: sequence, line: eventLine(event), text: partial.slice(0, newline) };
+        partial = partial.slice(newline + 1);
+        lineIndex += 1;
+      }
+    });
+    if (partial) mapping[lineIndex] = { eventIndex: Math.max(0, (events || []).length - 1), line: eventLine(events && events[events.length - 1]), text: partial };
+    return mapping;
+  }
+
+  function changedValueFor(event, name) {
+    if (!event || typeof event !== 'object') return { found: false };
+    const before = event.before_variables || event.variables || {};
+    const after = event.after_variables || event.variables || {};
+    if (own(after, name) && (!own(before, name) || !deepEqual(before[name], after[name]))) return { found: true, value: after[name], line: eventLine(event), sequence: event.sequence };
+    return { found: false };
+  }
+
+  function lastChangeForVariable(events, endIndex, name) {
+    for (let index = Math.min(endIndex, (events || []).length - 1); index >= 0; index -= 1) {
+      const event = events[index];
+      const info = lineInfoFor(event) || event && event.line_info || {};
+      const writes = Array.isArray(info.writes) ? info.writes.map(String) : [];
+      const changed = changedValueFor(event, name);
+      if (writes.includes(name) || changed.found) return { ...changed, found: true, eventIndex: index, value: changed.found ? changed.value : (eventVariables(event)[name]), line: eventLine(event), sequence: event.sequence ?? index };
+    }
+    return { found: false };
+  }
+
+  function debugEvidence(result, expected) {
+    const events = Array.isArray(result && result.events) ? result.events : Array.isArray(result && result.trace) ? result.trace : [];
+    const actual = result && (result.stdout !== undefined ? result.stdout : Array.isArray(result.output) ? result.output.join('\n') : '');
+    const comparison = compareDebugOutput(expected, actual);
+    const outputMap = outputEventMap(events);
+    const mapped = comparison.firstMismatch >= 0 ? outputMap[comparison.firstMismatch] : null;
+    const eventIndex = mapped ? mapped.eventIndex : -1;
+    const errorIndex = events.findIndex((event) => ['exception', 'error'].includes(String(event && (event.type || event.event)).toLowerCase()));
+    const selectedIndex = eventIndex >= 0 ? eventIndex : errorIndex;
+    const selectedEvent = selectedIndex >= 0 ? events[selectedIndex] : null;
+    const info = selectedEvent ? (lineInfoFor(selectedEvent) || selectedEvent.line_info || {}) : {};
+    const reads = Array.isArray(info.reads) ? info.reads.map(String) : [];
+    const variables = selectedEvent ? eventVariables(selectedEvent) : {};
+    const values = reads.map((name) => ({ name, value: own(variables, name) ? variables[name] : undefined, lastChange: lastChangeForVariable(events, selectedIndex, name) }));
+    const truncated = Boolean(result && result.limits && (result.limits.events_truncated || result.limits.stdout_truncated || result.limits.output_truncated));
+    return { comparison, outputMap, selectedIndex, selectedEvent, lineInfo: info, reads: values, truncated, errorIndex };
+  }
+
+  function debugSummary(evidence) {
+    const comparison = evidence && evidence.comparison;
+    if (!comparison) return 'Enter expected output, then compare it with the recorded output.';
+    if (evidence.errorIndex >= 0 && comparison.actualCount === 0) {
+      const event = evidence.selectedEvent;
+      return `The program errored${eventLine(event) ? ` on line ${eventLine(event)}` : ''}; expected output could not be produced.`;
+    }
+    if (comparison.matches) return comparison.expectedCount === 0 ? 'Both expected and actual output are empty.' : 'The recorded output matches the expected output line by line.';
+    const lineNumber = comparison.firstMismatch + 1;
+    const actual = comparison.actualLines[comparison.firstMismatch];
+    const expected = comparison.expectedLines[comparison.firstMismatch];
+    const phrase = actual === undefined ? `Line ${lineNumber} was missing; you expected ${visibleDebugText(expected)}.` : expected === undefined ? `The program printed an extra line ${lineNumber}: ${visibleDebugText(actual)}.` : `Line ${lineNumber} printed ${visibleDebugText(actual)} but you expected ${visibleDebugText(expected)}.`;
+    if (comparison.whitespaceOnly) return `${phrase} The difference is whitespace only (spaces are shown as · and tabs as →).`;
+    if (evidence.truncated) return `${phrase} The recorded output or trace was truncated, so the evidence is limited.`;
+    return phrase;
   }
 
   function targetFor(event, source) {
@@ -1254,6 +1422,8 @@
 
   async function runCode() {
     const source = $('code-editor').value;
+    state.debugEvidence = null;
+    renderDebugEvidence(null);
     setText('run-status', 'Running…');
     setText('run-time', 'now');
     const result = await callApi('/api/execute', { language: state.language, code: source });
@@ -1585,6 +1755,13 @@
       focusSourceLine(item.dataset.line);
     });
     $('clear-console').addEventListener('click', () => renderConsole([]));
+    $('debug-compare').addEventListener('click', compareExpectedOutput);
+    $('debug-ai-hint').addEventListener('click', askDebugHint);
+    $('debug-evidence').addEventListener('click', (event) => {
+      const button = event.target.closest('.debug-jump');
+      if (!button) return;
+      selectTimelineStep(Number(button.dataset.step) || 0, true);
+    });
     $('find-button').addEventListener('click', () => { $('find-bar').classList.remove('hidden'); $('find-input').focus(); });
     $('close-find').addEventListener('click', () => $('find-bar').classList.add('hidden'));
     $('replace-button').addEventListener('click', () => replaceText(false));
@@ -1645,6 +1822,13 @@
     structureKind,
     structureModel,
     compareStructure
+  });
+  window.CodeFlowDebug = Object.freeze({
+    debugOutputLines,
+    visibleDebugText,
+    compareDebugOutput,
+    outputEventMap,
+    debugSummary
   });
 
   function replaceText(allMatches) {
